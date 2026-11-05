@@ -1,0 +1,17 @@
+[package]
+name = "boot-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+boot-abi = { workspace = true }
+sha2 = { workspace = true }
+p256 = { workspace = true }
+chacha20 = { workspace = true }
+hkdf = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+rand = { workspace = true }

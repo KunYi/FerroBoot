@@ -1,0 +1,25 @@
+[package]
+name = "boot-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = ["boot-nor/std", "boot-journal/std"]
+
+[dependencies]
+boot-abi = { workspace = true }
+boot-image = { workspace = true }
+boot-crypto = { workspace = true }
+boot-nor = { workspace = true }
+boot-journal = { workspace = true }
+zerocopy = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+boot-nor = { workspace = true, features = ["std"] }
+boot-journal = { workspace = true, features = ["std"] }
+proptest = { workspace = true }
+p256 = { workspace = true, features = ["ecdsa", "arithmetic", "std"] }
+sha2 = { workspace = true }

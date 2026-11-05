@@ -1,0 +1,73 @@
+# ============================================================
+# FerroBoot .gitignore
+# Principle: DO commit Cargo.lock (reproducible builds, CI uses --locked)
+# ============================================================
+
+# ---- Rust / Cargo ----
+/target/
+**/target/
+**/*.rs.bk
+
+# ---- Firmware build artifacts ----
+*.elf
+*.bin
+*.hex
+*.srec
+*.dfu
+*.map
+*.lst
+*.o
+*.a
+/dist/
+/out/
+
+# Fixed binary test data (image vectors, KATs, etc.) must be committed;
+# explicitly re-include it here
+!tests/data/
+!tests/data/**
+
+# ---- Keys and secrets (NEVER commit) ----
+*.pem
+*.key
+*.der
+*.p12
+*.pfx
+*.seed
+.env
+.env.*
+keys/prod/
+# Development keys (clearly marked insecure, for CI/HIL only) live in
+# keys/dev/ and may be committed
+!keys/dev/
+!keys/dev/**
+
+# ---- NOR / device dumps and scratch files ----
+*.nor
+*.dump
+*.rtt
+*.log
+
+# ---- Fuzzing ----
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+# Committing proptest regression cases is recommended
+# (do not ignore proptest-regressions/)
+
+# ---- Python (HIL and host-side tools) ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# ---- Editors and OS ----
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*~
+.DS_Store
+Thumbs.db

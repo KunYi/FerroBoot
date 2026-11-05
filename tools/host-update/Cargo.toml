@@ -1,0 +1,10 @@
+[package]
+name = "host-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+serialport = { workspace = true }
+hex = { workspace = true }

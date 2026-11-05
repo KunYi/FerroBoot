@@ -1,0 +1,23 @@
+[package]
+name = "boot-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = ["boot-nor/std", "boot-journal/std", "boot-core/std"]
+
+[dependencies]
+boot-abi = { workspace = true }
+boot-image = { workspace = true }
+boot-crypto = { workspace = true }
+boot-nor = { workspace = true }
+boot-journal = { workspace = true }
+boot-core = { workspace = true }
+zerocopy = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+boot-nor = { workspace = true, features = ["std"] }
+boot-journal = { workspace = true, features = ["std"] }

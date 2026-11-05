@@ -1,0 +1,14 @@
+[package]
+name = "app-template"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
+panic-halt = { workspace = true }
+
+boot-abi = { workspace = true }
+boot-api-client = { workspace = true }
+boot-stm32h7 = { workspace = true }

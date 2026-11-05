@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/boot-abi",
+    "crates/boot-image",
+    "crates/boot-crypto",
+    "crates/boot-nor",
+    "crates/boot-journal",
+    "crates/boot-core",
+    "crates/boot-update",
+    "crates/boot-api-client",
+    "crates/boot-stm32h7",
+    "bootloader-h750",
+    "app-template",
+    "tools/xtask",
+    "tools/host-update",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["STM32H750 Bootloader Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Embedded core
+cortex-m = "0.7.10"
+cortex-m-rt = "0.7.5"
+stm32-metapac = { version = "21.0.0", default-features = false }
+defmt = "1.0.1"
+defmt-rtt = "1.0.1"
+panic-probe = { version = "1.0.0", features = ["defmt"] }
+panic-halt = "1.0.0"
+
+# Cryptography
+sha2 = { version = "0.10.9", default-features = false }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
+chacha20 = { version = "0.9.1", default-features = false, features = ["zeroize"] }
+hkdf = "0.12.4"
+zeroize = { version = "1.8.1", default-features = false, features = ["derive"] }
+crc32fast = { version = "1.4.2", default-features = false }
+
+# Parsing & serialization
+zerocopy = { version = "0.8.20", features = ["derive"] }
+
+# Testing & host tools
+proptest = "1.6.0"
+hex = "0.4.3"
+rand = "0.8.5"
+clap = { version = "4.5.31", features = ["derive"] }
+serialport = "4.7.0"
+
+# Workspace crates
+boot-abi = { path = "crates/boot-abi" }
+boot-image = { path = "crates/boot-image" }
+boot-crypto = { path = "crates/boot-crypto" }
+boot-nor = { path = "crates/boot-nor" }
+boot-journal = { path = "crates/boot-journal" }
+boot-core = { path = "crates/boot-core" }
+boot-update = { path = "crates/boot-update" }
+boot-api-client = { path = "crates/boot-api-client" }
+boot-stm32h7 = { path = "crates/boot-stm32h7" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = true
+overflow-checks = true
+
+[profile.dev]
+opt-level = 1
+debug = true
+panic = "abort"

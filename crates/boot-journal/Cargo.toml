@@ -1,0 +1,18 @@
+[package]
+name = "boot-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+std = ["boot-nor/std"]
+
+[dependencies]
+boot-abi = { workspace = true }
+boot-nor = { workspace = true }
+crc32fast = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+boot-nor = { workspace = true, features = ["std"] }

@@ -1,0 +1,8 @@
+[package]
+name = "boot-api-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+boot-abi = { workspace = true }

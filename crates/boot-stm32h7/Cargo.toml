@@ -1,0 +1,16 @@
+[package]
+name = "boot-stm32h7"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cortex-m = { workspace = true }
+stm32-metapac = { workspace = true, features = ["stm32h750vb", "pac"] }
+boot-abi = { workspace = true }
+boot-nor = { workspace = true }
+defmt = { workspace = true, optional = true }
+
+[features]
+default = []
+defmt = ["dep:defmt"]

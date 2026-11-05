@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+sha2 = { workspace = true }
+p256 = { workspace = true, features = ["ecdsa", "arithmetic", "std"] }
+chacha20 = { workspace = true }
+hkdf = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+zerocopy = { workspace = true }
+
+boot-abi = { workspace = true }
+boot-image = { workspace = true }
+boot-crypto = { workspace = true }
