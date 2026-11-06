@@ -170,13 +170,21 @@ pub fn init_gpio_ui() {
     });
     set_led(false);
 
-    // PC13 Input with Pull-up
+    // PC13 Input: pull resistor chosen from board polarity
     gpioc.moder().modify(|w| {
         w.set_moder(PIN_KEY2_PIN as usize, pac::gpio::vals::Moder::INPUT);
     });
     gpioc.pupdr().modify(|w| {
-        w.set_pupdr(PIN_KEY2_PIN as usize, pac::gpio::vals::Pupdr::PULL_UP);
+        w.set_pupdr(
+            PIN_KEY2_PIN as usize,
+        if KEY2_ACTIVE_LOW {
+                pac::gpio::vals::Pupdr::PULL_UP
+            } else {
+                pac::gpio::vals::Pupdr::PULL_DOWN
+            },
+        );
     });
+    cortex_m::asm::delay(100_000);
 }
 
 pub fn set_led(on: bool) {

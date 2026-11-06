@@ -33,7 +33,8 @@ pub const LED_ACTIVE_LOW: bool = true;
 
 pub const PIN_KEY2_PORT: char = 'C';
 pub const PIN_KEY2_PIN: u8 = 13; // PC13 (Rescue button)
-pub const KEY2_ACTIVE_LOW: bool = true;
+// KEY2 (PC13): switch to 3.3V -> reads HIGH when pressed, needs internal pull-down
+pub const KEY2_ACTIVE_LOW: bool = false;
 
 // SRAM Clocks required
 pub const RCC_AHB4ENR_RAMD3EN: u32 = 1 << 24; // SRAM4 clock enable (AHB4)
