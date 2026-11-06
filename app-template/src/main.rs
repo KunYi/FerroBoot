@@ -39,19 +39,49 @@ unsafe extern "C" fn app_yield() {
 
 #[entry]
 fn main() -> ! {
+    // 1. Initialize Clocks, SPI1, and USART1 for Application
+    boot_stm32h7::init_clocks();
+    boot_stm32h7::init_nor_cs();
+    boot_stm32h7::init_spi1();
+    boot_stm32h7::init_usart1();
+
+    boot_stm32h7::uart_write_str("\r\n========================================\r\n");
+    boot_stm32h7::uart_write_str("[APP] Hello from Application running in AXI SRAM!\r\n");
+    boot_stm32h7::uart_write_str("[APP] VTOR: 0x24000400, Executing from RAM.\r\n");
+
     // Connect to Bootloader ABI at 0x08000440
     if let Some(client) = BootApiClient::new() {
+        boot_stm32h7::uart_write_str("[APP] Connected to Bootloader ABI successfully.\r\n");
         if let Ok(info) = client.get_boot_info() {
+            boot_stm32h7::uart_write_str("[APP] Boot Slot: ");
+            boot_stm32h7::uart_write_hex(info.boot_slot);
+            boot_stm32h7::uart_write_str(", Trial Count: ");
+            boot_stm32h7::uart_write_hex(info.trial_count);
+            boot_stm32h7::uart_write_str("\r\n");
+
             // If in Trial boot, confirm the image to cancel automatic rollback
             if info.trial_count > 0 {
-                let _ = client.confirm(&APP_IO_OPS);
+                boot_stm32h7::uart_write_str("[APP] Confirming firmware update via ABI...\r\n");
+                let res = client.confirm(&APP_IO_OPS);
+                if res.is_ok() {
+                    boot_stm32h7::uart_write_str("[APP] Firmware successfully CONFIRMED! Boot is permanent.\r\n");
+                } else {
+                    boot_stm32h7::uart_write_str("[APP] Firmware confirm failed!\r\n");
+                }
             }
         }
+    } else {
+        boot_stm32h7::uart_write_str("[APP] ERROR: Failed to locate Bootloader ABI at 0x08000440!\r\n");
     }
 
+    boot_stm32h7::uart_write_str("========================================\r\n");
+
     // Application main loop
+    let mut led_state = false;
     loop {
         boot_stm32h7::Iwdg::kick();
+        led_state = !led_state;
+        boot_stm32h7::set_led(led_state);
         for _ in 0..2_000_000 {
             cortex_m::asm::nop();
         }

@@ -14,7 +14,7 @@ use boot_crypto::{
     ct_equal, derive_device_key, verify_p256_signature, xchacha20_process, KeyTable,
     Sha256Context,
 };
-use boot_image::{parse_image, ParsedImage, ENC_SCHEME_DEVICE};
+use boot_image::{parse_image, ImageHeader, ParsedImage, ENC_SCHEME_DEVICE, HEADER_STRUCT_SIZE};
 use boot_journal::SlotJournalState;
 use boot_nor::{NorFlash, SecureRegion};
 use zeroize::Zeroize;
@@ -197,24 +197,24 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
             &mut device_key,
         )?;
 
-        // 3. Preliminary parse to extract image size and ENC_INFO
-        // In MCUboot format: header, protected TLVs, and unprotected TLVs are in plaintext.
-        // Image body is what is encrypted.
-        let preliminary = parse_image(
-            &header_buf,
-            self.expected_board_id,
-            self.current_bl_version,
-            require_encrypted,
-        );
-
-        let hdr = match preliminary {
-            Ok(ref p) => p.header,
-            Err(_) => {
+        // 3. Preliminary parse of the image header (first 32 bytes)
+        let (hdr_ref, _) = ImageHeader::ref_from_prefix(&header_buf[..HEADER_STRUCT_SIZE])
+            .map_err(|_| {
                 device_key.zeroize();
                 nor_seed.zeroize();
-                return Err(ERR_VERIFY_FAILED);
-            }
-        };
+                ERR_VERIFY_FAILED
+            })?;
+        let hdr = *hdr_ref;
+        if hdr.validate(boot_abi::NOR_SLOT_SIZE).is_err() {
+            device_key.zeroize();
+            nor_seed.zeroize();
+            return Err(ERR_VERIFY_FAILED);
+        }
+        if require_encrypted && !hdr.is_encrypted() {
+            device_key.zeroize();
+            nor_seed.zeroize();
+            return Err(ERR_VERIFY_FAILED);
+        }
 
         let hdr_size = hdr.ih_hdr_size as usize;
         let img_size = hdr.ih_img_size as usize;
@@ -244,17 +244,17 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
             curr_ram += chunk_len;
         }
 
+        // Read trailing TLVs directly into ram_buffer after body for metadata parsing
+        let tlv_start = slot_offset + (hdr_size + img_size) as u32;
+        let tlv_len = 1024.min(ram_buffer.len().saturating_sub(hdr_size + img_size));
+        self.nor
+            .read(tlv_start, &mut ram_buffer[hdr_size + img_size..hdr_size + img_size + tlv_len])
+            .map_err(|_| ERR_VERIFY_FAILED)?;
+
         // Decrypt image body in RAM if encrypted
         if hdr.is_encrypted() {
-            // Read trailing TLVs from NOR to locate ENC_INFO
-            let tlv_offset = slot_offset + (hdr_size + img_size) as u32;
-            let mut tlv_buf = [0u8; 512];
-            self.nor
-                .read(tlv_offset, &mut tlv_buf)
-                .map_err(|_| ERR_VERIFY_FAILED)?;
-
             let parsed_with_tlv = parse_image(
-                &tlv_buf,
+                &ram_buffer[..hdr_size + img_size + tlv_len],
                 self.expected_board_id,
                 self.current_bl_version,
                 require_encrypted,
@@ -291,86 +291,100 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         // 5. Compute SHA-256 over Plaintext (Header + Plaintext Image Body + Protected TLV)
         sha_ctx.update(&ram_buffer[..hdr_size + img_size]);
         if hdr.ih_protect_tlv_size > 0 {
-            let prot_offset = slot_offset + (hdr_size + img_size) as u32;
-            let mut prot_buf = [0u8; 256];
-            let prot_len = (hdr.ih_protect_tlv_size as usize).min(prot_buf.len());
-            self.nor
-                .read(prot_offset, &mut prot_buf[..prot_len])
-                .map_err(|_| ERR_VERIFY_FAILED)?;
-            sha_ctx.update(&prot_buf[..prot_len]);
+            let prot_len = hdr.ih_protect_tlv_size as usize;
+            sha_ctx.update(&ram_buffer[hdr_size + img_size..hdr_size + img_size + prot_len]);
         }
         let calculated_hash = sha_ctx.finalize();
 
         // 6. Verify Signature against keytable
-        let mut full_tlv_bytes = [0u8; 1024];
-        let tlv_start = slot_offset + (hdr_size + img_size) as u32;
-        self.nor
-            .read(tlv_start, &mut full_tlv_bytes)
-            .map_err(|_| ERR_VERIFY_FAILED)?;
-
-        // Combine header + dummy body + TLVs to run parse_image for TLVs
-        let mut parse_buf = [0u8; 2048];
-        parse_buf[..hdr_size].copy_from_slice(&ram_buffer[..hdr_size]);
-        let tlv_tot = 512.min(full_tlv_bytes.len());
-        parse_buf[hdr_size + img_size..hdr_size + img_size + tlv_tot]
-            .copy_from_slice(&full_tlv_bytes[..tlv_tot]);
-
-        let parsed = parse_image(
-            &parse_buf,
+        let parse_res = parse_image(
+            &ram_buffer[..hdr_size + img_size + tlv_len],
             self.expected_board_id,
             self.current_bl_version,
             require_encrypted,
-        )
-        .map_err(|_| {
-            ram_buffer.zeroize();
-            ERR_VERIFY_FAILED
-        })?;
-
-        // Check hash
-        if let Some(expected_hash) = parsed.sha256 {
-            if !ct_equal(&calculated_hash, expected_hash) {
+        );
+        let parsed = match parse_res {
+            Ok(p) => p,
+            Err(_) => {
                 ram_buffer.zeroize();
                 return Err(ERR_VERIFY_FAILED);
             }
-        } else {
+        };
+
+        // Extract required metadata to release borrow on ram_buffer
+        let expected_hash = match parsed.sha256 {
+            Some(h) => *h,
+            None => {
+                ram_buffer.zeroize();
+                return Err(ERR_VERIFY_FAILED);
+            }
+        };
+        let expected_keyhash = match parsed.keyhash {
+            Some(k) => *k,
+            None => {
+                ram_buffer.zeroize();
+                return Err(ERR_VERIFY_FAILED);
+            }
+        };
+        let mut sig_buf = [0u8; 64];
+        let sig_len = match parsed.signature {
+            Some(s) if s.len() <= 64 => {
+                sig_buf[..s.len()].copy_from_slice(s);
+                s.len()
+            }
+            _ => {
+                ram_buffer.zeroize();
+                return Err(ERR_VERIFY_FAILED);
+            }
+        };
+
+        let header = parsed.header;
+        let sig_type = parsed.sig_type;
+        let image_type = parsed.image_type;
+        let board_id = parsed.board_id;
+        let min_bl_version = parsed.min_bl_version;
+        let enc_info = parsed.enc_info;
+        drop(parsed);
+
+        // Check hash
+        if !ct_equal(&calculated_hash, &expected_hash) {
             ram_buffer.zeroize();
             return Err(ERR_VERIFY_FAILED);
         }
 
         // Check signature against matching key in keytable
-        if let (Some(sig), Some(keyhash)) = (parsed.signature, parsed.keyhash) {
-            let mut key_found = false;
-            for key_slot in &self.keytable.keys {
-                if key_slot.pubkey_len > 0 && ct_equal(&key_slot.keyhash, keyhash) {
-                    verify_p256_signature(
-                        &calculated_hash,
-                        &key_slot.pubkey[..key_slot.pubkey_len as usize],
-                        sig,
-                    )?;
+        let mut key_found = false;
+        for key_slot in &self.keytable.keys {
+            if key_slot.pubkey_len > 0 && ct_equal(&key_slot.keyhash, &expected_keyhash) {
+                if verify_p256_signature(
+                    &calculated_hash,
+                    &key_slot.pubkey[..key_slot.pubkey_len as usize],
+                    &sig_buf[..sig_len],
+                ).is_ok() {
                     key_found = true;
                     break;
                 }
             }
-            if !key_found {
-                ram_buffer.zeroize();
-                return Err(ERR_VERIFY_FAILED);
-            }
-        } else {
+        }
+        if !key_found {
             ram_buffer.zeroize();
             return Err(ERR_VERIFY_FAILED);
         }
 
+        // Clear any trailing TLVs in RAM above loaded image
+        ram_buffer[hdr_size + img_size..].fill(0);
+
         // Return validated header metadata (static lifetime by cloning necessary fields)
         Ok(ParsedImage {
-            header: parsed.header,
+            header,
             sha256: None,
             keyhash: None,
             signature: None,
-            sig_type: parsed.sig_type,
-            image_type: parsed.image_type,
-            board_id: parsed.board_id,
-            min_bl_version: parsed.min_bl_version,
-            enc_info: parsed.enc_info,
+            sig_type,
+            image_type,
+            board_id,
+            min_bl_version,
+            enc_info,
             total_len: total_load_len,
         })
     }

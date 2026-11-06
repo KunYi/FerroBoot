@@ -17,7 +17,10 @@ SECTIONS
   {
     KEEP(*(.boot_api));
   } > FLASH
+} INSERT AFTER .vector_table;
 
+SECTIONS
+{
   .secrets 0x0801F000 :
   {
     KEEP(*(.secrets));

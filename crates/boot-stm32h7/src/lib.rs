@@ -62,6 +62,22 @@ pub fn init_clocks() {
         w.set_latency(4);
     });
 
+    // Configure bus prescalers (HCLK max 200MHz, APB1/2/3/4 max 100MHz):
+    pac::RCC.d1cfgr().modify(|w| {
+        w.set_d1cpre(pac::rcc::vals::Hpre::DIV1);
+        w.set_hpre(pac::rcc::vals::Hpre::DIV2);
+        w.set_d1ppre(pac::rcc::vals::Ppre::DIV2);
+    });
+
+    pac::RCC.d2cfgr().modify(|w| {
+        w.set_d2ppre1(pac::rcc::vals::Ppre::DIV2);
+        w.set_d2ppre2(pac::rcc::vals::Ppre::DIV2);
+    });
+
+    pac::RCC.d3cfgr().modify(|w| {
+        w.set_d3ppre(pac::rcc::vals::Ppre::DIV2);
+    });
+
     // 3. Enable HSE (25MHz)
     pac::RCC.cr().modify(|w| {
         w.set_hseon(true);
@@ -88,7 +104,7 @@ pub fn init_clocks() {
     pac::RCC.pllcfgr().modify(|w| {
         w.set_divpen(0, true);
         w.set_pllrge(0, pac::rcc::vals::Pllrge::RANGE4);
-        w.set_pllvcosel(0, pac::rcc::vals::Pllvcosel::MEDIUM_VCO);
+        w.set_pllvcosel(0, pac::rcc::vals::Pllvcosel::WIDE_VCO);
     });
 
     pac::RCC.cr().modify(|w| {
@@ -270,6 +286,11 @@ pub fn init_spi1() {
         w.set_spe(false);
     });
 
+    // Set SSI high while SPE is 0 to prevent MODF when enabling Master mode
+    spi.cr1().modify(|w| {
+        w.set_ssi(true);
+    });
+
     spi.cfg1().modify(|w| {
         w.set_mbr(pac::spi::vals::Mbr::DIV16);
         w.set_dsize(7); // 8-bit data frame
@@ -283,15 +304,55 @@ pub fn init_spi1() {
         w.set_cpha(pac::spi::vals::Cpha::FIRST_EDGE);
     });
 
+    // Clear any pending MODF or error flags
+    spi.ifcr().write(|w| {
+        w.set_modfc(true);
+        w.set_ovrc(true);
+    });
+
+    // Enable SPI peripheral
     spi.cr1().modify(|w| {
         w.set_ssi(true);
         w.set_spe(true);
     });
 }
 
-/// Blocking SPI transfer.
+/// Blocking SPI transfer for STM32H7 SPI1 (SPI V5).
 pub fn spi1_transfer(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
+    if len == 0 {
+        return 0;
+    }
     let spi = pac::SPI1;
+
+    // Clear any previous error flags
+    spi.ifcr().write(|w| {
+        w.set_eotc(true);
+        w.set_txtfc(true);
+        w.set_modfc(true);
+        w.set_ovrc(true);
+        w.set_udrc(true);
+    });
+
+    // Ensure Master is active, SSI is high and SPE is enabled
+    spi.cfg2().modify(|w| {
+        w.set_master(pac::spi::vals::Master::MASTER);
+        w.set_ssm(true);
+    });
+    spi.cr1().modify(|w| {
+        w.set_ssi(true);
+        w.set_spe(true);
+    });
+
+    // Set packet transfer size
+    spi.cr2().modify(|w| {
+        w.set_tsize(len as u16);
+    });
+
+    // Start transfer
+    spi.cr1().modify(|w| {
+        w.set_cstart(true);
+    });
+
     for i in 0..len as usize {
         let byte_out = if !tx.is_null() {
             unsafe { *tx.add(i) }
@@ -299,14 +360,26 @@ pub fn spi1_transfer(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
             0x00
         };
 
-        // Write to TXDR
-        while !spi.sr().read().txp() {}
+        // Write to TXDR with timeout
+        let mut timeout = 200_000;
+        while !spi.sr().read().txp() && timeout > 0 {
+            timeout -= 1;
+        }
+        if timeout == 0 {
+            return -1;
+        }
         unsafe {
             core::ptr::write_volatile(spi.txdr8().as_ptr(), byte_out);
         }
 
-        // Read from RXDR
-        while !spi.sr().read().rxp() {}
+        // Read from RXDR with timeout
+        timeout = 200_000;
+        while !spi.sr().read().rxp() && timeout > 0 {
+            timeout -= 1;
+        }
+        if timeout == 0 {
+            return -2;
+        }
         let byte_in = unsafe { core::ptr::read_volatile(spi.rxdr8().as_ptr()) };
 
         if !rx.is_null() {
@@ -315,7 +388,20 @@ pub fn spi1_transfer(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
             }
         }
     }
-    0
+
+    // Wait for End Of Transfer with timeout
+    let mut timeout = 200_000;
+    while !spi.sr().read().eot() && timeout > 0 {
+        timeout -= 1;
+    }
+
+    // Clear EOT and TXTF flags
+    spi.ifcr().write(|w| {
+        w.set_eotc(true);
+        w.set_txtfc(true);
+    });
+
+    if timeout == 0 { -3 } else { 0 }
 }
 
 /// Polling USART1 driver for debug log and UART rescue.
@@ -362,6 +448,29 @@ pub fn uart_write_str(s: &str) {
     for b in s.bytes() {
         uart_write_byte(b);
     }
+}
+
+pub fn uart_write_hex(b: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    uart_write_byte(HEX[(b >> 4) as usize]);
+    uart_write_byte(HEX[(b & 0x0F) as usize]);
+}
+
+pub fn uart_read_byte() -> Option<u8> {
+    let usart = pac::USART1;
+    if usart.isr().read().rxne() {
+        Some((usart.rdr().read().dr() & 0xFF) as u8)
+    } else {
+        None
+    }
+}
+
+pub fn uart_read_byte_blocking() -> u8 {
+    let usart = pac::USART1;
+    while !usart.isr().read().rxne() {
+        Iwdg::kick();
+    }
+    (usart.rdr().read().dr() & 0xFF) as u8
 }
 
 /// Executes jump to Application strictly following §6.1 checklist.

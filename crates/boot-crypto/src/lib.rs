@@ -10,7 +10,7 @@ use boot_abi::{ERR_DECRYPT_FAILED, ERR_INVALID_PARAM, ERR_VERIFY_FAILED};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::XChaCha20;
 use hkdf::Hkdf;
-use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -117,7 +117,7 @@ pub fn verify_p256_signature(
     };
 
     verifying_key
-        .verify(hash, &signature)
+        .verify_prehash(hash, &signature)
         .map_err(|_| ERR_VERIFY_FAILED)?;
 
     Ok(())

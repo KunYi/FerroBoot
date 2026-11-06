@@ -140,7 +140,7 @@ fn test_end_to_end_nor_load_and_verification() {
             1,
         );
         let res = loader.load_and_verify(BOOT_SLOT_A, &mut ram_buf, false);
-        assert!(res.is_ok(), "Slot A should verify successfully");
+        assert!(res.is_ok(), "Slot A should verify successfully: {:?}", res);
     }
 
     // Negative test: Corrupt 1 byte in NOR and verify rejection

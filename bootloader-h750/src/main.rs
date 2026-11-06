@@ -15,7 +15,8 @@ use boot_nor::{NorFlash, SpiNorIoOpsDriver};
 use boot_stm32h7::{
     init_clocks, init_gpio_ui, init_nor_cs, init_spi1, init_sram4_ecc, init_usart1,
     is_key2_pressed, jump_to_app, read_mcu_uid, set_led, set_nor_cs, spi1_transfer,
-    uart_write_str, Iwdg, TampControl,
+    uart_read_byte_blocking, uart_write_byte, uart_write_hex, uart_write_str, Iwdg,
+    TampControl,
 };
 use cortex_m_rt::entry;
 use panic_halt as _;
@@ -93,17 +94,17 @@ pub static PUBLIC_KEY_TABLE: KeyTable = KeyTable {
             reserved: [0; 3],
             // Default dev P-256 public key (65 bytes SEC1 uncompressed)
             pubkey: [
-                0x04, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5,
-                0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4,
-                0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96, 0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a,
-                0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e, 0x16, 0x2b, 0xce, 0x33,
-                0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
+                0x04, 0x6f, 0xf0, 0x3b, 0x94, 0x92, 0x41, 0xce, 0x1d, 0xad, 0xd4, 0x35, 0x19,
+                0xe6, 0x96, 0x0e, 0x0a, 0x85, 0xb4, 0x1a, 0x69, 0xa0, 0x5c, 0x32, 0x81, 0x03,
+                0xaa, 0x2b, 0xce, 0x15, 0x94, 0xca, 0x16, 0x3c, 0x4f, 0x75, 0x3a, 0x55, 0xbf,
+                0x01, 0xdc, 0x53, 0xf6, 0xc0, 0xb0, 0xc7, 0xee, 0xe7, 0x8b, 0x40, 0xc6, 0xff,
+                0x7d, 0x25, 0xa9, 0x6e, 0x22, 0x82, 0xb9, 0x89, 0xce, 0xf7, 0x1c, 0x14, 0x4a,
             ],
             pubkey_len: 65,
             keyhash: [
-                0x8e, 0x0b, 0x24, 0x47, 0xa4, 0x3e, 0xa3, 0x32, 0x71, 0x4c, 0x91, 0x5a, 0x52,
-                0x15, 0x55, 0x1b, 0x4e, 0xb2, 0x61, 0xc9, 0x58, 0x51, 0x68, 0x44, 0x90, 0x19,
-                0x77, 0x42, 0x31, 0x48, 0x6b, 0xb9,
+                0x25, 0x6b, 0x1b, 0xe3, 0x27, 0x45, 0xd1, 0xd1, 0xc9, 0xd4, 0x91, 0x21, 0xcc,
+                0x87, 0xbc, 0x45, 0x1c, 0x4f, 0x2d, 0xfa, 0x75, 0x6d, 0x89, 0xb4, 0xc9, 0x10,
+                0xaf, 0xae, 0xb6, 0x25, 0x8a, 0xe0,
             ],
         },
         boot_crypto::PublicKeySlot {
@@ -387,11 +388,26 @@ fn main() -> ! {
 
     // 3. Probe SPI NOR
     let mut nor_driver = SpiNorIoOpsDriver::new(&LOCAL_IO_OPS);
-    if let Ok(_jedec) = nor_driver.read_jedec_id() {
-        uart_write_str("[BL] NOR Flash JEDEC ID detected.\r\n");
-    } else {
-        uart_write_str("[BL] NOR Flash communication failed!\r\n");
-        enter_rescue_mode(BOOT_REASON_ALL_INVALID);
+    match nor_driver.read_jedec_id() {
+        Ok(jedec) => {
+            uart_write_str("[BL] NOR Flash JEDEC ID: 0x");
+            uart_write_hex(jedec[0]);
+            uart_write_str(" 0x");
+            uart_write_hex(jedec[1]);
+            uart_write_str(" 0x");
+            uart_write_hex(jedec[2]);
+            uart_write_str("\r\n");
+        }
+        Err(err) => {
+            uart_write_str("[BL] NOR Flash communication failed! Error: ");
+            match err {
+                boot_nor::NorError::IoError => uart_write_str("IoError"),
+                boot_nor::NorError::Timeout => uart_write_str("Timeout"),
+                _ => uart_write_str("Other"),
+            }
+            uart_write_str("\r\n");
+            enter_rescue_mode(BOOT_REASON_ALL_INVALID);
+        }
     }
 
     // 4. Replay Journal
@@ -492,13 +508,144 @@ fn main() -> ! {
     }
 }
 
+fn read_delimited_hex() -> (Option<u32>, u8) {
+    let mut val = 0u32;
+    let mut digits = 0;
+    loop {
+        let b = uart_read_byte_blocking();
+        if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
+            if digits > 0 {
+                return (Some(val), b);
+            } else {
+                continue;
+            }
+        }
+        let d = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            _ => return (None, b),
+        };
+        val = (val << 4) | d;
+        digits += 1;
+    }
+}
+
 fn enter_rescue_mode(_reason: u8) -> ! {
     set_led(true);
-    uart_write_str("[RESCUE] Entering UART Rescue Mode. Waiting for commands...\r\n");
+    uart_write_str("[RESCUE] Entering UART Rescue Mode. Ready.\r\n");
+
+    let mut nor = SpiNorIoOpsDriver::new(&LOCAL_IO_OPS);
+
     loop {
         Iwdg::kick();
-        for _ in 0..1_000_000 {
-            cortex_m::asm::nop();
+        let cmd = uart_read_byte_blocking();
+        match cmd {
+            b'p' | b'P' => {
+                // Ping
+                uart_write_str("PONG\r\n");
+            }
+            b'i' | b'I' => {
+                // Info
+                uart_write_str("[RESCUE] BL v1.0, STM32H750, NOR BY25Q32ES\r\n");
+            }
+            b'e' | b'E' => {
+                // Erase slot block 0: e <slot>\n
+                let mut slot = uart_read_byte_blocking();
+                while slot == b' ' || slot == b'\t' {
+                    slot = uart_read_byte_blocking();
+                }
+                let base = if slot == b'0' {
+                    NOR_SLOT_A_OFFSET
+                } else {
+                    NOR_SLOT_B_OFFSET
+                };
+                if nor.erase_block_64k(base).is_ok() {
+                    uart_write_str("OK\r\n");
+                } else {
+                    uart_write_str("ERR\r\n");
+                }
+            }
+            b'w' | b'W' => {
+                // Write chunk: w <slot> <offset_hex> <len_hex>\n<bytes>
+                let mut slot = uart_read_byte_blocking();
+                while slot == b' ' || slot == b'\t' {
+                    slot = uart_read_byte_blocking();
+                }
+                let slot_base = if slot == b'0' {
+                    NOR_SLOT_A_OFFSET
+                } else {
+                    NOR_SLOT_B_OFFSET
+                };
+                let (offset, _) = match read_delimited_hex() {
+                    (Some(o), d) => (o, d),
+                    (None, _) => {
+                        uart_write_str("ERR_OFF\r\n");
+                        continue;
+                    }
+                };
+                let (len, mut delim) = match read_delimited_hex() {
+                    (Some(l), d) => (l, d),
+                    (None, _) => {
+                        uart_write_str("ERR_LEN\r\n");
+                        continue;
+                    }
+                };
+                while delim != b'\n' {
+                    delim = uart_read_byte_blocking();
+                }
+
+                let mut buf = [0u8; 512];
+                let to_read = len.min(512) as usize;
+                for i in 0..to_read {
+                    buf[i] = uart_read_byte_blocking();
+                }
+                if nor.write(slot_base + offset, &buf[..to_read]).is_ok() {
+                    uart_write_str("OK\r\n");
+                } else {
+                    uart_write_str("ERR_WR\r\n");
+                }
+            }
+            b'm' | b'M' => {
+                // Mark slot as pending in journal: m <slot>\n
+                let mut slot_char = uart_read_byte_blocking();
+                while slot_char == b' ' || slot_char == b'\t' {
+                    slot_char = uart_read_byte_blocking();
+                }
+                let slot_id = if slot_char == b'0' { 0 } else { 1 };
+                if let Ok(mut journal) = JournalManager::init(&mut nor) {
+                    let res = journal.append_record(
+                        &mut nor,
+                        slot_id,
+                        SLOT_STATE_PENDING,
+                        0,
+                        0,
+                        ImageVersion {
+                            major: 1,
+                            minor: 0,
+                            revision: 0,
+                            build_num: 1,
+                        },
+                        0,
+                        0,
+                    );
+                    if res.is_ok() {
+                        uart_write_str("OK\r\n");
+                    } else {
+                        uart_write_str("ERR_JRN\r\n");
+                    }
+                } else {
+                    uart_write_str("ERR_INIT\r\n");
+                }
+            }
+            b'r' | b'R' => {
+                // Reboot
+                uart_write_str("REBOOT\r\n");
+                cortex_m::peripheral::SCB::sys_reset();
+            }
+            _ => {
+                // Ignore unexpected characters (whitespace, etc.)
+            }
         }
     }
 }
