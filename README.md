@@ -83,19 +83,82 @@ docs/                # plan, experiment notes, ADRs
 - `docs/experiments.md`: hardware experiment results (created during implementation).
 - `docs/adr/`: architecture decision records (created during implementation).
 
-## Development environment
+## Development Environment
 
-Prerequisites (concrete build and flash commands will be added once M0 is done):
+### Prerequisites
+
+Install the Rust target and required development tools:
 
 ```sh
+# Rust embedded target
 rustup target add thumbv7em-none-eabihf
+
+# Probe-RS tools for debugging and flashing
 cargo install probe-rs-tools --locked
-pip install imgtool        # signing tool
+
+# Python dependencies for UART rescue upload
+python3 -m pip install pyserial
 ```
 
-Always build with `cargo build --locked`, and commit `Cargo.lock`.
+The project uses a Rust-based `xtask` tool for image signing. No external signing utility is required for the current development workflow.
 
-## Security notes
+**Build requirements:**
+
+- Always use `--locked` for Cargo build and run commands.
+- `Cargo.lock` must be committed to the repository.
+- Install `arm-none-eabi-binutils` to provide `arm-none-eabi-objcopy`.
+
+Concrete hardware build and flash instructions will be documented after M0 is complete.
+
+## Verify Steps
+
+The following commands build the bootloader and application, generate a signed application image, and upload it through the UART rescue interface.
+
+### 1. Build
+
+```sh
+cargo build --release --locked \
+    --target thumbv7em-none-eabihf \
+    -p bootloader-h750 \
+    -p app-template
+```
+
+### 2. Extract Application Binary
+
+Convert the application ELF into a raw binary image:
+
+```sh
+arm-none-eabi-objcopy \
+    -O binary \
+    target/thumbv7em-none-eabihf/release/app-template \
+    app.bin
+```
+
+### 3. Sign Application Image
+
+Use the project's `xtask` utility to generate an MCUboot-compatible signed image:
+
+```sh
+cargo run --release --locked -p xtask -- \
+    sign --bin app.bin --out app_signed.bin
+```
+
+### 4. Upload Through UART Rescue Mode
+
+Connect the STM32H750 UART rescue interface and upload the signed image:
+
+```sh
+python3 tools/rescue_upload.py \
+    --port /dev/ttyACM0 \
+    --image app_signed.bin \
+    --slot 0
+```
+
+Replace `/dev/ttyACM0` with the actual serial port of your development board.
+
+**Note:** The current UART rescue implementation supports images up to 64KB because it only erases the first 64KB block of a slot. Larger application images require an updated erase implementation before this verification procedure can be used.## Security notes
+
+## Security Notes
 
 - **Never commit private keys or production keys.** The default `.gitignore` blocks `*.pem`, `*.key`, and `keys/prod/`.
 - `keys/dev/` holds only development keys that are clearly marked as insecure, for CI and hardware-in-the-loop testing.
