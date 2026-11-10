@@ -7,6 +7,7 @@
 #![no_main]
 
 use boot_abi::IoOps;
+use boot_abi::{ERR_INVALID_STATE, SLOT_STATE_TESTING};
 use boot_api_client::BootApiClient;
 use cortex_m_rt::entry;
 use panic_halt as _;
@@ -62,12 +63,20 @@ fn main() -> ! {
 
             // If in Trial boot, confirm the image to cancel automatic rollback
             if info.trial_count > 0 {
-                boot_stm32h7::uart_write_str("[APP] Confirming firmware update via ABI...\r\n");
-                let res = client.confirm(&APP_IO_OPS);
-                if res.is_ok() {
-                    boot_stm32h7::uart_write_str("[APP] Firmware successfully CONFIRMED! Boot is permanent.\r\n");
+                let in_testing = matches!(
+                    client.slot_status(info.boot_slot),
+                    Ok(s) if s.state == SLOT_STATE_TESTING
+                );
+
+                if in_testing {
+                    boot_stm32h7::uart_write_str("[APP] Confirming firmware update via ABI...\r\n");
+                    match client.confirm(&APP_IO_OPS) {
+                        Ok(()) => boot_stm32h7::uart_write_str("[APP] Firmware successfully CONFIRMED! Boot is permanent.\r\n"),
+                        Err(ERR_INVALID_STATE) => boot_stm32h7::uart_write_str("[APP] Already confirmed.\r\n"),
+                        Err(_) => boot_stm32h7::uart_write_str("[APP] Firmware confirm failed!\r\n"),
+                    }
                 } else {
-                    boot_stm32h7::uart_write_str("[APP] Firmware confirm failed!\r\n");
+                    boot_stm32h7::uart_write_str("[APP] Already confirmed, normal boot.\r\n");
                 }
             }
         }

@@ -316,7 +316,7 @@ unsafe extern "C" fn abi_confirm(io: *const IoOps) -> i32 {
         &mut driver,
         slot,
         SLOT_STATE_CONFIRMED,
-        target.trial,
+        0,
         0,
         target.img_ver,
         target.min_version,
