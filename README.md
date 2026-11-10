@@ -1,3 +1,4 @@
+
 # FerroBoot
 
 > A signed, encrypted, RAM-loading bootloader for STM32H7, written in Rust.
@@ -38,7 +39,7 @@ See [`docs/plan.md`](docs/plan.md), section 4.4, for the full pin map and the de
 
 ## Architecture overview
 
-```
+```text
 SPI NOR (A/B slots, journal)               Internal flash, 128KB
 ┌──────────────────────┐                  ┌───────────────────────┐
 │ Slot A / Slot B      │                  │ FerroBoot             │
@@ -59,7 +60,7 @@ The complete specification of the memory map, NOR layout, image format, journal,
 
 ## Repository layout (planned)
 
-```
+```text
 crates/
 ├─ boot-abi/         # repr(C) types, error codes, function table (shared by bootloader and app)
 ├─ boot-image/       # header/TLV parsing and validation rules
@@ -104,6 +105,7 @@ The project uses a Rust-based `xtask` tool for image signing. No external signin
 
 **Build requirements:**
 
+- GNU Make.
 - Always use `--locked` for Cargo build and run commands.
 - `Cargo.lock` must be committed to the repository.
 - Install `arm-none-eabi-binutils` to provide `arm-none-eabi-objcopy`.
@@ -112,51 +114,108 @@ Concrete hardware build and flash instructions will be documented after M0 is co
 
 ## Verify Steps
 
-The following commands build the bootloader and application, generate a signed application image, and upload it through the UART rescue interface.
+The Makefile provides separate targets for building firmware, signing the application image, and uploading it through the UART rescue interface.
 
-### 1. Build
+### 1. Build Bootloader and Application
+
+Build both firmware components without signing the application image:
 
 ```sh
+make build
+```
+
+The individual components can also be built separately:
+
+```sh
+make boot    # Build only the bootloader
+make app     # Build only the application
+```
+
+The application target uses file-based dependency tracking. Cargo is invoked again only when relevant application build inputs have changed or the application ELF is missing.
+
+### 2. Sign the Application Image
+
+Generate the signed application image:
+
+```sh
+make sign
+```
+
+This target:
+
+1. Builds the application if its ELF is missing or its build inputs have changed.
+2. Converts the application ELF into a raw binary image.
+3. Signs the binary using the project's Rust-based `xtask` utility.
+
+Signing depends only on the application and the signing tool. It does **not** build the bootloader.
+
+The generated files are stored under `target/thumbv7em-none-eabihf/release/`:
+
+- `app-template`: application ELF.
+- `app.bin`: raw application binary.
+- `app_signed.bin`: signed application image.
+
+The default target builds both firmware components and signs the application:
+
+```sh
+make
+```
+
+### 3. Upload Through UART Rescue Mode
+
+Connect the STM32H750 UART rescue interface and execute:
+
+```sh
+make upload
+```
+
+The default serial port is `/dev/ttyACM0`. Override it when necessary:
+
+```sh
+make upload PORT=/dev/ttyUSB0
+```
+
+The upload target builds and signs the application image when required. It does not build the bootloader.
+
+### 4. Clean Build Artifacts
+
+Remove Cargo build artifacts and generated application images:
+
+```sh
+make clean
+```
+
+### Manual Build and Upload
+
+The equivalent commands without Make are:
+
+```sh
+# Build the bootloader and application
 cargo build --release --locked \
     --target thumbv7em-none-eabihf \
     -p bootloader-h750 \
     -p app-template
-```
 
-### 2. Extract Application Binary
-
-Convert the application ELF into a raw binary image:
-
-```sh
+# Convert the application ELF to a raw binary
 arm-none-eabi-objcopy \
     -O binary \
     target/thumbv7em-none-eabihf/release/app-template \
-    app.bin
-```
+    target/thumbv7em-none-eabihf/release/app.bin
 
-### 3. Sign Application Image
-
-Use the project's `xtask` utility to generate an MCUboot-compatible signed image:
-
-```sh
+# Sign the application image
 cargo run --release --locked -p xtask -- \
-    sign --bin app.bin --out app_signed.bin
-```
+    sign \
+    --bin target/thumbv7em-none-eabihf/release/app.bin \
+    --out target/thumbv7em-none-eabihf/release/app_signed.bin
 
-### 4. Upload Through UART Rescue Mode
-
-Connect the STM32H750 UART rescue interface and upload the signed image:
-
-```sh
+# Upload the signed image
 python3 tools/rescue_upload.py \
     --port /dev/ttyACM0 \
-    --image app_signed.bin \
+    --image target/thumbv7em-none-eabihf/release/app_signed.bin \
     --slot 0
 ```
 
-Replace `/dev/ttyACM0` with the actual serial port of your development board.
-
-**Note:** The current UART rescue implementation supports images up to 64KB because it only erases the first 64KB block of a slot. Larger application images require an updated erase implementation before this verification procedure can be used.## Security notes
+**UART rescue limitation:** The current implementation supports images up to 64KB because it only erases the first 64KB block of a slot. Larger application images require an updated erase implementation before they can be uploaded safely.
 
 ## Security Notes
 
