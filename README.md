@@ -133,7 +133,15 @@ make app     # Build only the application
 
 The application target uses file-based dependency tracking. Cargo is invoked again only when relevant application build inputs have changed or the application ELF is missing.
 
-### 2. Sign the Application Image
+### 2. Flash the Bootloader
+
+Connect a supported debug probe to the STM32H750 SWD interface and run:
+
+```sh
+make flash-boot
+```
+
+### 3. Sign the Application Image
 
 Generate the signed application image:
 
@@ -195,6 +203,10 @@ cargo build --release --locked \
     --target thumbv7em-none-eabihf \
     -p bootloader-h750 \
     -p app-template
+
+# download bootloader into chip flash
+probe-rs download --chip STM32H750VBTx target/thumbv7em-none-eabihf/release/bootloader-h750
+probe-rs reset --chip STM32H750VBTx
 
 # Convert the application ELF to a raw binary
 arm-none-eabi-objcopy \

@@ -1,11 +1,14 @@
 
 # Configuration
 TARGET       := thumbv7em-none-eabihf
+CHIP         := STM32H750VBTx
+PROBE_RS     := probe-rs
 CARGO_FLAGS  := --release --locked
 PORT         := /dev/ttyACM0
 
 # Artifact paths
 RELEASE_DIR  := target/$(TARGET)/release
+BOOT_ELF     := $(RELEASE_DIR)/bootloader-h750
 APP_ELF      := $(RELEASE_DIR)/app-template
 APP_BIN      := $(RELEASE_DIR)/app.bin
 APP_SIGNED   := $(RELEASE_DIR)/app_signed.bin
@@ -31,8 +34,7 @@ XTASK_BUILD_INPUTS := $(shell find tools/xtask -type f \
 
 XTASK_BUILD_INPUTS += Cargo.toml Cargo.lock
 
-.PHONY: all build boot app sign upload clean
-
+.PHONY: all build boot flash-boot app sign upload clean
 # Default target: build both firmware components and sign the application
 all: build sign
 
@@ -42,6 +44,11 @@ build: boot app
 # Build the bootloader
 boot:
 	cargo build $(CARGO_FLAGS) --target $(TARGET) -p bootloader-h750
+
+# Flash the bootloader to internal flash and reset the MCU
+flash-boot: boot
+	$(PROBE_RS) download --chip $(CHIP) $(BOOT_ELF)
+	$(PROBE_RS) reset --chip $(CHIP)
 
 # Build the application ELF only when its inputs have changed
 $(APP_ELF): $(APP_BUILD_INPUTS)
