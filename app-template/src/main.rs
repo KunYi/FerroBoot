@@ -41,6 +41,7 @@ unsafe extern "C" fn app_yield() {
 fn main() -> ! {
     // 1. Initialize Clocks, SPI1, and USART1 for Application
     boot_stm32h7::init_clocks();
+    boot_stm32h7::init_gpio_ui();
     boot_stm32h7::init_nor_cs();
     boot_stm32h7::init_spi1();
     boot_stm32h7::init_usart1();
@@ -82,7 +83,7 @@ fn main() -> ! {
         boot_stm32h7::Iwdg::kick();
         led_state = !led_state;
         boot_stm32h7::set_led(led_state);
-        for _ in 0..2_000_000 {
+        for _ in 0..50_000_000 {
             cortex_m::asm::nop();
         }
     }
