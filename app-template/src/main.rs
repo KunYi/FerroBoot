@@ -93,13 +93,30 @@ fn main() -> ! {
     boot_stm32h7::uart_write_str("========================================\r\n");
 
     // Application main loop
+    let mut last_print = boot_stm32h7::millis();
+    let mut last_led_toggle = last_print;
     let mut led_state = false;
+
     loop {
         boot_stm32h7::Iwdg::kick();
-        led_state = !led_state;
-        boot_stm32h7::set_led(led_state);
-        for _ in 0..50_000_000 {
-            cortex_m::asm::nop();
+
+        let now = boot_stm32h7::millis();
+        // Print tick every 1000 ms.
+        if now.wrapping_sub(last_print) >= 1000 {
+            last_print = now;
+
+            boot_stm32h7::uart_write_str("[APP] tick = ");
+            boot_stm32h7::uart_write_u32(now);
+            boot_stm32h7::uart_write_str(" ms\r\n");
+        }
+
+        // Toggle LED every 500 ms.
+        if now.wrapping_sub(last_led_toggle) >= 500 {
+            last_led_toggle = now;
+
+            led_state = !led_state;
+            boot_stm32h7::set_led(led_state);
         }
     }
+
 }

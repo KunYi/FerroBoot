@@ -507,6 +507,27 @@ pub fn uart_write_str(s: &str) {
     }
 }
 
+pub fn uart_write_u32(mut value: u32) {
+    let mut buf = [0u8; 10];
+    let mut len = 0;
+
+    if value == 0 {
+        uart_write_byte(b'0');
+        return;
+    }
+
+    while value > 0 {
+        buf[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+
+    while len > 0 {
+        len -= 1;
+        uart_write_byte(buf[len]);
+    }
+}
+
 pub fn uart_write_hex(b: u8) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     uart_write_byte(HEX[(b >> 4) as usize]);
