@@ -9,6 +9,7 @@ pub mod board;
 
 use board::*;
 use boot_abi::{SRAM4_BASE, SRAM4_SIZE, TAMP_CMD_ENTER_RESCUE};
+use core::sync::atomic::{AtomicU32, Ordering};
 use stm32_metapac as pac;
 
 /// Reads the unique 96-bit MCU UID from STM32H7 factory information block.
@@ -177,7 +178,7 @@ pub fn init_gpio_ui() {
     gpioc.pupdr().modify(|w| {
         w.set_pupdr(
             PIN_KEY2_PIN as usize,
-        if KEY2_ACTIVE_LOW {
+            if KEY2_ACTIVE_LOW {
                 pac::gpio::vals::Pupdr::PULL_UP
             } else {
                 pac::gpio::vals::Pupdr::PULL_DOWN
@@ -257,6 +258,54 @@ impl Iwdg {
 
     pub fn kick() {
         pac::IWDG1.kr().write(|w| w.set_key(0xAAAA.into()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Millisecond tick (SysTick, 1 kHz)
+// ---------------------------------------------------------------------------
+
+static MILLIS: AtomicU32 = AtomicU32::new(0);
+
+/// Advances the millisecond counter. Call this from the `SysTick` exception handler:
+///
+/// ```ignore
+/// #[cortex_m_rt::exception]
+/// fn SysTick() { boot_stm32h7::systick_tick(); }
+/// ```
+pub fn systick_tick() {
+    MILLIS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Milliseconds since `init_millis()`; wraps after 49.7 days (use `wrapping_sub` for deltas).
+pub fn millis() -> u32 {
+    MILLIS.load(Ordering::Relaxed)
+}
+
+/// Starts SysTick at 1 kHz from the core clock and enables interrupts.
+///
+/// Call after `init_clocks()` (the reload value assumes `CORE_CLOCK_HZ`). The bootloader
+/// leaves PRIMASK set when it jumps to the application, so an application using the tick must
+/// call this itself.
+pub fn init_millis() {
+    let mut peripherals = unsafe {
+        cortex_m::Peripherals::steal()
+    };
+
+    let syst = &mut peripherals.SYST;
+
+    syst.set_reload(CORE_CLOCK_HZ / 1000 - 1);
+    syst.clear_current();
+
+    syst.set_clock_source(
+        cortex_m::peripheral::syst::SystClkSource::Core
+    );
+
+    syst.enable_counter();
+
+    syst.enable_interrupt();
+    unsafe {
+        cortex_m::interrupt::enable();
     }
 }
 
