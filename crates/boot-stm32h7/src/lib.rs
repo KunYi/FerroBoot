@@ -581,6 +581,12 @@ pub unsafe fn jump_to_app(vtor_addr: u32) -> ! {
     pac::RCC.cfgr().modify(|w| w.set_sw(pac::rcc::vals::Sw::HSI));
     while pac::RCC.cfgr().read().sws() != pac::rcc::vals::Sw::HSI {}
 
+    // 5. Disable PLL1 after switching SYSCLK to HSI.
+    pac::RCC.cr().modify(|w| {
+        w.set_pllon(0, false);
+    });
+    while pac::RCC.cr().read().pllrdy(0) {}
+
     // Ensure SRAM4 clock remains enabled for BootInfo
     pac::RCC.ahb4enr().modify(|w| {
         w.0 |= RCC_AHB4ENR_RAMD3EN;
