@@ -415,7 +415,10 @@ pub fn init_spi1() {
 }
 
 /// Blocking SPI transfer for STM32H7 SPI1 (SPI V5).
-pub fn spi1_transfer(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
+///
+/// # Safety
+/// `tx` (if not null) and `rx` (if not null) must point to valid memory buffers of at least `len` bytes.
+pub unsafe fn spi1_transfer(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
     if len == 0 {
         return 0;
     }
