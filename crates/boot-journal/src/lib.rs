@@ -9,7 +9,7 @@ use boot_abi::{
     ImageVersion, NOR_JOURNAL_SECTOR_0, NOR_JOURNAL_SECTOR_1, NOR_SECTOR_SIZE, SLOT_STATE_EMPTY,
 };
 use boot_nor::{NorError, NorFlash};
-use crc32fast::Hasher;
+use boot_crc::Hasher;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const JOURNAL_SECTOR_MAGIC: u32 = 0x4A4E_524C; // 'JRNL'

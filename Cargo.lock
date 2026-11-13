@@ -168,6 +168,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-crc"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+]
+
+[[package]]
 name = "boot-crypto"
 version = "0.1.0"
 dependencies = [
@@ -195,8 +202,8 @@ name = "boot-journal"
 version = "0.1.0"
 dependencies = [
  "boot-abi",
+ "boot-crc",
  "boot-nor",
- "crc32fast",
  "zerocopy",
 ]
 
@@ -205,7 +212,7 @@ name = "boot-nor"
 version = "0.1.0"
 dependencies = [
  "boot-abi",
- "crc32fast",
+ "boot-crc",
  "zerocopy",
 ]
 

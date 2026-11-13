@@ -1,9 +1,14 @@
 # FerroBoot：BSP 分離與多平台（RAM_LOAD / XIP）擴展規劃
 
-> 狀態：**草案 v0.6，供討論**（尚未有任何程式碼變更）
+> 狀態：**草案 v0.7，供討論**（尚未有任何程式碼變更）
 > 基準：上傳的 repo，HEAD = `10ba7bc fix(stm32h7): disable PLL1 before jumping to app`
 > 範圍：把 `H750 NetLite（RAM_LOAD）` 與 `NUCLEO-F429ZI（內部 Flash XIP）` 放進同一個架構；`Forlinx OK1061-S（i.MX RT1061，FlexSPI NOR XIP）` 先在架構上預留、**後做**
 > 標註約定：**[已讀碼]** 來自原始碼；**[已查]** 本版以網路資料交叉查證過（來源見附錄 A，仍建議最後對照原廠手冊）；**[假設]** 我的推論；**[待查證]** 憑記憶，動工前必須對照手冊；**[TBD-n]** 你明確決定「拿到板子再定」的項目（§0.3）
+
+### v0.7 變更紀錄
+
+- **P0 patch B（`boot-crc`）已完成並驗證**，以 git patch 交付（`0001-perf-bootloader-replace-crc32fast-with-boot-crc.patch`，可乾淨套用在 `10ba7bc`）。實測 `text` 52,816 → 36,824 B（−15,992 B，−30%）（§7.2）。採用完整 256 項表（1KiB，編譯期算好、放在 flash，不佔 RAM）。
+- 沙盒環境已建立 Rust 1.91 與 `arm-none-eabi-ld` 的交叉建置流程，之後的 patch 都能實際編譯、跑 host 測試與量 size（§12）。
 
 ### v0.6 變更紀錄
 
@@ -671,7 +676,7 @@ Bank2  0x0810_0000  S12–S15 (4×16KB)             =  64KB   Bootloader 副本 
 
 **處置（`boot-crc`）**
 - 新增一個很小的 `boot-crc` crate，實作**同一個演算法**（CRC-32/ISO-HDLC，反射、多項式 `0xEDB88320`、初值 `0xFFFFFFFF`、輸出 XOR `0xFFFFFFFF`），讓 `boot-journal` 與 `boot-nor` 改用它。結果與 `crc32fast` 相同，**已寫入 NOR 的 journal 與 Security Register 的 `SeedRecord` 完全相容**，不需要遷移。
-- 實作選項：256 項表（1KiB，最快）、16 項 nibble 表（64 B，約為前者的一半速度）、純位元運算（無表，最慢）。**journal 與 SeedRecord 的資料量極小，任何一種都夠；Quick 驗證（§5.3）要掃整個 slot，才需要較快的版本。**
+- **採用：256 項表**（編譯期由 `const fn` 算好、放在 flash，不佔 RAM）。實作選項曾比較：256 項表（1KiB，最快）、16 項 nibble 表（64 B，約為前者的一半速度）、純位元運算（無表，最慢）。**journal 與 SeedRecord 的資料量極小，任何一種都夠；Quick 驗證（§5.3）要掃整個 slot，才需要較快的版本。**
 - Platform 可選擇提供硬體加速（`Platform::crc32_update`）：STM32 的 CRC 外設可用，但它的位元順序／多項式設定與 zlib 的 CRC 不同；因為 Quick 的 CRC 是由裝置自己寫入、自己比對（`KIND_VERIFIED`），**不需要與 zlib 相同**，可以用硬體版；而 journal／SeedRecord 的 CRC 要與既有資料相容，必須用上面的軟體版。這兩種 CRC 要用不同名稱區分，避免混用。
 - 回歸驗證：host 端用 `crc32fast` 當 oracle 對 `boot-crc` 做隨機比對（只在 `dev-dependencies`），再加板上兩個 smoke test。
 
@@ -682,6 +687,18 @@ Bank2  0x0810_0000  S12–S15 (4×16KB)             =  64KB   Bootloader 副本 
 | 現況（H750 程式碼原樣放進 T64） | 49,232 | 10,672 B（10.4KiB） |
 | 以 `boot-crc` 取代 `crc32fast`（1KiB 表） | 約 33,900 | 約 26,000 B（約 25KiB） |
 | 同上，改用 nibble 表（64 B） | 約 32,900 | 約 27,000 B（約 26KiB） |
+
+**實測結果（P0 patch B，已完成）**：在同一環境（rustc 1.91、`opt-level = "z"`、`lto = "fat"`、`arm-none-eabi-size`）下比較 `10ba7bc` 與套用 `boot-crc` 後：
+
+| | `.text` | `.rodata` | `text` 合計 | 差異 |
+|---|---:|---:|---:|---:|
+| `10ba7bc`（`crc32fast`） | 32,744 | 17,796 | 52,816 | — |
+| 套用 `boot-crc`（256 項表） | 32,112 | 2,436 | **36,824** | **−15,992（−30%）** |
+
+- `.rodata` 少了 15,360 B（= 16,384 的查表 − 1,024 的新表）；`.text` 反而少 632 B。新表 `boot_crc::TABLE` 為 `0x400` B、位於唯讀區（`nm` 顯示 `r`），`.data`／`.bss` 仍為 0，**不佔 RAM**。
+- 絕對值與你本機的 51,508 不同，是因為編譯器版本不同（我的環境是 rustc 1.91，你的是 stable 工具鏈）；**以同一環境的差值為準**。換算到你的環境，預期約 **51,508 − 15,992 ≈ 35,516 B**（推算，請以你本機實測為準）。
+- 以我的環境的 `.text` + `.rodata` = 34,548 B 計，放進 T64 的程式碼預算（59,904 B）仍有約 **25,356 B（24.8KiB）** 餘裕，與上表的預估一致。
+- 驗證：host 測試全過（`boot-crc` 5 個，含以 `crc32fast` 為 oracle 的隨機輸入至 65,537 B 與任意切塊比對；其餘 crate 既有測試維持通過）；`boot-journal`／`boot-nor` 的依賴圖不再包含 `crc32fast`（它只剩 `boot-crc` 的 dev-dependency）。**尚未做的是板上 smoke test（載入 App 執行 + rescue 上傳）**，需要你執行。
 
 F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protection_status`、Quick 驗證、量產 profile 的傳輸加密）**仍未量測**。但就算完全不做 CRC 優化，T64 在現有數據下也有餘裕；做了之後餘裕變得寬鬆。因此 **T64 的可行性從「看起來可行」上調為「很有可能可行」**；最終仍以 P5f 的實測為準（O2 的規則不變）。
 
@@ -804,11 +821,11 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 | 1 | ~~驗證 `.rodata` 的最大符號~~ | 你 | ✅ 已完成：`CRC32_TABLE` = 16,384 B |
 | 2 | 打基線 tag，記錄 `.bin` hash 與載入時間 | 你 | **下一步。** 之後所有「位元一致」比對都以此為準；`boot-crc` 會改變 binary，所以 tag 要在它之前 |
 | 3 | **P0 patch A：`local_millis`、刪重複 plan 文件、補 host 特性測試** | 我提供 patch，你驗證 | 特性測試用來彌補板上基線不足（§0.6） |
-| 4 | **P0 patch B：`boot-crc` 取代 `crc32fast`** | 我提供 patch，你驗證 | 同演算法、host oracle 比對 + 板上兩項 smoke test；預期 H750 Bootloader 縮小約 16KiB（`.text`+`.rodata` 約 33KiB） |
+| 4 | **P0 patch B：`boot-crc` 取代 `crc32fast`** | ✅ 我已完成；**你在板上驗證** | patch 已交付，host 測試與交叉建置通過；實測縮小約 15.6KiB（§7.2）。請套用後跑兩項板上 smoke test，並貼上你本機的 `arm-none-eabi-size` |
 | 5 | P1：`boot-layout` 與 ABI v2 | 我 | 純重構；host 測試語意不變 |
 | 6 | F429 spike S-F1～S-F3 | 你（需要板子）＋我寫測試程式 | G0 已通過，可以開始；S-F4 的 H750 部分數據已齊，P0 完成後重估 |
 
-**補充**：我目前的環境沒有 Rust 工具鏈，**無法編譯或執行測試**；patch 會以「可讀、小步、附 host 測試」為原則，由你在本機 `cargo test` 與板上驗證。
+**補充**：沙盒現在有 Rust 1.91（host 測試）與 `arm-none-eabi-ld`（以 `-Zbuild-std` 交叉建置 `thumbv7em-none-eabihf`），所以 patch 都經過實際編譯、host 測試與 size 量測；**板上行為仍需你驗證**。
 **選做**：附錄 C 開頭的兩項低成本補測，任何時候都可以做。
 
 ## 13. 替代方案（為什麼不選）

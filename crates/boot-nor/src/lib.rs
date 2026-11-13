@@ -10,7 +10,7 @@
 extern crate std;
 
 use boot_abi::{IoOps, NOR_PAGE_SIZE};
-use crc32fast::Hasher;
+use boot_crc::Hasher;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const CMD_WRITE_ENABLE: u8 = 0x06;

@@ -4,6 +4,7 @@ members = [
     "crates/boot-abi",
     "crates/boot-image",
     "crates/boot-crypto",
+    "crates/boot-crc",
     "crates/boot-nor",
     "crates/boot-journal",
     "crates/boot-core",
@@ -54,6 +55,7 @@ serialport = "4.7.0"
 boot-abi = { path = "crates/boot-abi" }
 boot-image = { path = "crates/boot-image" }
 boot-crypto = { path = "crates/boot-crypto" }
+boot-crc = { path = "crates/boot-crc" }
 boot-nor = { path = "crates/boot-nor" }
 boot-journal = { path = "crates/boot-journal" }
 boot-core = { path = "crates/boot-core" }

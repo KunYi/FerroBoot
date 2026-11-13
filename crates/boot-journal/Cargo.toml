@@ -11,7 +11,7 @@ std = ["boot-nor/std"]
 [dependencies]
 boot-abi = { workspace = true }
 boot-nor = { workspace = true }
-crc32fast = { workspace = true }
+boot-crc = { workspace = true }
 zerocopy = { workspace = true }
 
 [dev-dependencies]

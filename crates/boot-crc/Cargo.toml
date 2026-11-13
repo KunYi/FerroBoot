@@ -1,0 +1,16 @@
+[package]
+name = "boot-crc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Small CRC-32/ISO-HDLC (zlib-compatible), compile-time 1 KiB table in flash, for FerroBoot"
+
+[features]
+default = []
+
+[dependencies]
+
+[dev-dependencies]
+# Oracle only: used by tests to prove boot-crc matches crc32fast bit-for-bit.
+# Not part of any firmware build graph.
+crc32fast = { workspace = true, features = ["std"] }
