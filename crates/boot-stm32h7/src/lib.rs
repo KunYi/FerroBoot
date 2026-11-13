@@ -595,6 +595,7 @@ pub fn uart_read_byte_blocking() -> u8 {
 ///
 /// # Safety
 /// This function changes processor state, disables interrupts, changes VTOR, and resets SP.
+#[cfg(target_arch = "arm")]
 pub unsafe fn jump_to_app(vtor_addr: u32) -> ! {
     // 1. Disable all interrupts globally
     cortex_m::interrupt::disable();
@@ -652,4 +653,13 @@ pub unsafe fn jump_to_app(vtor_addr: u32) -> ! {
         reset = in(reg) reset_handler,
         options(noreturn)
     );
+}
+
+/// Mock jump_to_app for non-ARM host architectures (host unit tests).
+///
+/// # Safety
+/// Calling this function on non-ARM host will panic with `unimplemented!`.
+#[cfg(not(target_arch = "arm"))]
+pub unsafe fn jump_to_app(_vtor_addr: u32) -> ! {
+    unimplemented!("jump_to_app is only supported on ARM target architecture");
 }
