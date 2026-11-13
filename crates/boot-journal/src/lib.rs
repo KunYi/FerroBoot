@@ -452,4 +452,143 @@ mod tests {
         assert_eq!(reloaded.generation, mgr.generation);
         assert_eq!(reloaded.slot_a.state, mgr.slot_a.state);
     }
+
+    // -----------------------------------------------------------------------
+    // Characterization tests (P0): pin the on-flash format and the recovery
+    // behaviour so later refactors (Layout, Flash trait, ...) cannot change them
+    // silently. Golden bytes were computed independently with Python's zlib.
+    // -----------------------------------------------------------------------
+
+    /// JournalRecord::new(STATE, seq 7, slot B, PENDING, trial 0, flags 0,
+    /// v1.2.0x0304+0x0A0B0C0D, min_version 5, revoke mask 0x03)
+    const GOLDEN_RECORD: [u8; 32] = [
+        0x43, 0x52, 0x01, 0x00, 0x07, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x02, 0x04,
+        0x03, 0x0D, 0x0C, 0x0B, 0x0A, 0x05, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0xFF, 0x16, 0x0B,
+        0xD0, 0x08,
+    ];
+
+    /// JournalSectorHeader::new(generation 5)
+    const GOLDEN_HEADER: [u8; 16] = [
+        0x4C, 0x52, 0x4E, 0x4A, 0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xF6, 0xC8, 0xFA,
+        0x33,
+    ];
+
+    fn golden_inputs() -> JournalRecord {
+        JournalRecord::new(
+            RECORD_KIND_STATE,
+            7,
+            1,
+            SLOT_STATE_PENDING,
+            0,
+            0,
+            ImageVersion { major: 1, minor: 2, revision: 0x0304, build_num: 0x0A0B_0C0D },
+            5,
+            0x03,
+        )
+    }
+
+    #[test]
+    fn golden_record_bytes_are_stable() {
+        let rec = golden_inputs();
+        assert_eq!(rec.as_bytes(), &GOLDEN_RECORD[..]);
+        assert!(rec.is_valid());
+    }
+
+    #[test]
+    fn golden_sector_header_bytes_are_stable() {
+        let hdr = JournalSectorHeader::new(5);
+        assert_eq!(hdr.as_bytes(), &GOLDEN_HEADER[..]);
+        assert!(hdr.is_valid());
+    }
+
+    #[test]
+    fn any_single_bit_flip_invalidates_a_record() {
+        for byte in 0..RECORD_SIZE {
+            for bit in 0..8 {
+                let mut raw = GOLDEN_RECORD;
+                raw[byte] ^= 1 << bit;
+                let rec = JournalRecord::read_from_bytes(&raw).unwrap();
+                assert!(!rec.is_valid(), "byte {byte} bit {bit} went unnoticed");
+            }
+        }
+    }
+
+    #[test]
+    fn any_single_bit_flip_invalidates_a_sector_header() {
+        for byte in 0..16 {
+            for bit in 0..8 {
+                let mut raw = GOLDEN_HEADER;
+                raw[byte] ^= 1 << bit;
+                let hdr = JournalSectorHeader::read_from_bytes(&raw).unwrap();
+                assert!(!hdr.is_valid(), "byte {byte} bit {bit} went unnoticed");
+            }
+        }
+    }
+
+    fn v1() -> ImageVersion {
+        ImageVersion { major: 1, minor: 0, revision: 0, build_num: 1 }
+    }
+
+    #[test]
+    fn power_cut_during_append_is_ignored_and_journal_stays_usable() {
+        let mut nor = RamNor::new(64 * 1024);
+        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        mgr.append_record(&mut nor, 0, SLOT_STATE_WRITTEN, 0, 0, v1(), 1, 0).unwrap();
+
+        // Cut power part-way through programming the next record.
+        nor.fail_after_bytes = Some(nor.bytes_written + 20);
+        let res = mgr.append_record(&mut nor, 0, SLOT_STATE_PENDING, 0, 0, v1(), 1, 0);
+        assert!(res.is_err());
+
+        // "Reboot": power is back, the half-written record must be skipped.
+        nor.fail_after_bytes = None;
+        let mut re = JournalManager::init(&mut nor).unwrap();
+        assert_eq!(re.slot_a.state, SLOT_STATE_WRITTEN, "torn record must not take effect");
+        assert_eq!(re.next_record_offset, 16 + 2 * RECORD_SIZE as u32, "torn slot is skipped, not reused");
+
+        // And the journal keeps working afterwards.
+        re.append_record(&mut nor, 0, SLOT_STATE_PENDING, 0, 0, v1(), 1, 0).unwrap();
+        let again = JournalManager::init(&mut nor).unwrap();
+        assert_eq!(again.slot_a.state, SLOT_STATE_PENDING);
+    }
+
+    #[test]
+    fn corrupted_record_crc_falls_back_to_previous_state() {
+        let mut nor = RamNor::new(64 * 1024);
+        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        mgr.append_record(&mut nor, 0, SLOT_STATE_CONFIRMED, 0, 0, v1(), 1, 0).unwrap();
+        mgr.append_record(&mut nor, 0, SLOT_STATE_TESTING, 1, 0, v1(), 1, 0).unwrap();
+
+        // Flash can only clear bits: zero a CRC byte of the second record.
+        let crc_byte = NOR_JOURNAL_SECTOR_0 + 16 + RECORD_SIZE as u32 + 28;
+        nor.write(crc_byte, &[0x00]).unwrap();
+
+        let re = JournalManager::init(&mut nor).unwrap();
+        assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
+    }
+
+    #[test]
+    fn slots_are_tracked_independently() {
+        let mut nor = RamNor::new(64 * 1024);
+        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let v2 = ImageVersion { major: 2, minor: 0, revision: 0, build_num: 7 };
+        mgr.append_record(&mut nor, 0, SLOT_STATE_CONFIRMED, 0, 0, v1(), 1, 0).unwrap();
+        mgr.append_record(&mut nor, 1, SLOT_STATE_PENDING, 0, 0, v2, 2, 0x01).unwrap();
+
+        let re = JournalManager::init(&mut nor).unwrap();
+        assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
+        assert_eq!(re.slot_a.img_ver, v1());
+        assert_eq!(re.slot_b.state, SLOT_STATE_PENDING);
+        assert_eq!(re.slot_b.img_ver, v2);
+        assert_eq!(re.slot_b.min_version, 2);
+        assert_eq!(re.slot_b.key_revoke_mask, 0x01);
+    }
+
+    #[test]
+    fn invalid_slot_number_is_rejected() {
+        let mut nor = RamNor::new(64 * 1024);
+        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let res = mgr.append_record(&mut nor, 2, SLOT_STATE_PENDING, 0, 0, v1(), 1, 0);
+        assert!(matches!(res, Err(JournalError::InvalidSlot)));
+    }
 }

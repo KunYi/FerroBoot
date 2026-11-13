@@ -654,4 +654,32 @@ mod tests {
         let nor = SpiNorIoOpsDriver::new(&FAKE_IO);
         assert_eq!(nor.software_reset(), Ok(()));
     }
+
+    /// SeedRecord::new([0x77; 32]); CRC computed independently with Python's zlib.
+    const GOLDEN_SEED_RECORD: [u8; 64] = [
+        0x44, 0x45, 0x45, 0x53, 0x01, 0xFF, 0xFF, 0xFF, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+        0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
+        0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x4C, 0xD5, 0x19, 0xC9,
+    ];
+
+    #[test]
+    fn golden_seed_record_bytes_are_stable() {
+        let rec = SeedRecord::new([0x77u8; 32]);
+        assert_eq!(rec.as_bytes(), &GOLDEN_SEED_RECORD[..]);
+        assert!(rec.is_valid());
+    }
+
+    #[test]
+    fn any_single_bit_flip_invalidates_a_seed_record() {
+        for byte in 0..GOLDEN_SEED_RECORD.len() {
+            for bit in 0..8 {
+                let mut raw = GOLDEN_SEED_RECORD;
+                raw[byte] ^= 1 << bit;
+                let rec = SeedRecord::read_from_bytes(&raw).unwrap();
+                assert!(!rec.is_valid(), "byte {byte} bit {bit} went unnoticed");
+            }
+        }
+    }
 }

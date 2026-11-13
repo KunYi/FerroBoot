@@ -442,4 +442,117 @@ mod tests {
         let decision = decide(&slot_a, &slot_b, 3);
         assert_eq!(decision, BootDecision::EnterRescue);
     }
+
+    // -----------------------------------------------------------------------
+    // Characterization tests (P0): the full decide() behaviour table.
+    // -----------------------------------------------------------------------
+
+    use boot_abi::{
+        ImageVersion, SLOT_STATE_EMPTY, SLOT_STATE_INVALID, SLOT_STATE_WRITTEN,
+    };
+
+    fn slot(state: u8, trial: u8, major: u8, minor: u8, revision: u16, build: u32) -> SlotJournalState {
+        SlotJournalState {
+            state,
+            trial,
+            img_ver: ImageVersion { major, minor, revision, build_num: build },
+            ..SlotJournalState::default()
+        }
+    }
+
+    fn plain(state: u8) -> SlotJournalState {
+        slot(state, 0, 1, 0, 0, 1)
+    }
+
+    fn try_a(fallback: Option<u8>) -> BootDecision {
+        BootDecision::TryCandidates { primary: BOOT_SLOT_A, fallback }
+    }
+
+    fn try_b(fallback: Option<u8>) -> BootDecision {
+        BootDecision::TryCandidates { primary: BOOT_SLOT_B, fallback }
+    }
+
+    #[test]
+    fn both_confirmed_equal_versions_prefers_slot_a() {
+        let d = decide(&plain(SLOT_STATE_CONFIRMED), &plain(SLOT_STATE_CONFIRMED), 3);
+        assert_eq!(d, try_a(Some(BOOT_SLOT_B)));
+    }
+
+    #[test]
+    fn both_confirmed_newer_version_wins_at_each_field() {
+        let base = slot(SLOT_STATE_CONFIRMED, 0, 2, 5, 7, 9);
+        // (field that is bigger in B)
+        let newer_b = [
+            slot(SLOT_STATE_CONFIRMED, 0, 3, 0, 0, 0), // major dominates minor/revision/build
+            slot(SLOT_STATE_CONFIRMED, 0, 2, 6, 0, 0), // minor dominates revision/build
+            slot(SLOT_STATE_CONFIRMED, 0, 2, 5, 8, 0), // revision dominates build
+            slot(SLOT_STATE_CONFIRMED, 0, 2, 5, 7, 10), // build number
+        ];
+        for b in newer_b {
+            assert_eq!(decide(&base, &b, 3), try_b(Some(BOOT_SLOT_A)), "B {:?}", b.img_ver);
+            // Swapped: A newer -> A.
+            assert_eq!(decide(&b, &base, 3), try_a(Some(BOOT_SLOT_B)), "A {:?}", b.img_ver);
+        }
+    }
+
+    #[test]
+    fn state_priority_is_testing_then_pending_then_confirmed() {
+        let testing = slot(SLOT_STATE_TESTING, 1, 1, 0, 0, 1);
+        let pending = plain(SLOT_STATE_PENDING);
+        let confirmed = plain(SLOT_STATE_CONFIRMED);
+        assert_eq!(decide(&testing, &pending, 3), try_a(Some(BOOT_SLOT_B)));
+        assert_eq!(decide(&pending, &testing, 3), try_b(Some(BOOT_SLOT_A)));
+        assert_eq!(decide(&pending, &confirmed, 3), try_a(Some(BOOT_SLOT_B)));
+        assert_eq!(decide(&confirmed, &pending, 3), try_b(Some(BOOT_SLOT_A)));
+        assert_eq!(decide(&testing, &confirmed, 3), try_a(Some(BOOT_SLOT_B)));
+        assert_eq!(decide(&confirmed, &testing, 3), try_b(Some(BOOT_SLOT_A)));
+    }
+
+    #[test]
+    fn state_priority_beats_a_newer_version() {
+        // A confirmed v9 must not outrank a Pending v1: an update in progress wins.
+        let confirmed_new = slot(SLOT_STATE_CONFIRMED, 0, 9, 0, 0, 0);
+        let pending_old = slot(SLOT_STATE_PENDING, 0, 1, 0, 0, 0);
+        assert_eq!(decide(&confirmed_new, &pending_old, 3), try_b(Some(BOOT_SLOT_A)));
+    }
+
+    #[test]
+    fn testing_is_bootable_only_while_trials_remain() {
+        for max in [1u8, 3, 5] {
+            let last_chance = slot(SLOT_STATE_TESTING, max - 1, 1, 0, 0, 1);
+            let exhausted = slot(SLOT_STATE_TESTING, max, 1, 0, 0, 1);
+            let confirmed = plain(SLOT_STATE_CONFIRMED);
+            assert_eq!(decide(&last_chance, &confirmed, max), try_a(Some(BOOT_SLOT_B)), "max {max}");
+            assert_eq!(
+                decide(&exhausted, &confirmed, max),
+                try_b(None),
+                "max {max}: exhausted trial reverts to the confirmed slot"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_written_and_invalid_slots_are_never_bootable() {
+        let confirmed = plain(SLOT_STATE_CONFIRMED);
+        for state in [SLOT_STATE_EMPTY, SLOT_STATE_WRITTEN, SLOT_STATE_INVALID, 0xEE] {
+            let other = plain(state);
+            assert_eq!(decide(&confirmed, &other, 3), try_a(None), "B state {state}");
+            assert_eq!(decide(&other, &confirmed, 3), try_b(None), "A state {state}");
+        }
+    }
+
+    #[test]
+    fn nothing_bootable_enters_rescue() {
+        let dead = [
+            plain(SLOT_STATE_EMPTY),
+            plain(SLOT_STATE_WRITTEN),
+            plain(SLOT_STATE_INVALID),
+            slot(SLOT_STATE_TESTING, 3, 1, 0, 0, 1),
+        ];
+        for a in &dead {
+            for b in &dead {
+                assert_eq!(decide(a, b, 3), BootDecision::EnterRescue);
+            }
+        }
+    }
 }
