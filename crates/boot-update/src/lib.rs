@@ -64,6 +64,12 @@ impl Drop for UpdateSession {
     }
 }
 
+impl Default for UpdateSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UpdateSession {
     pub fn new() -> Self {
         Self {

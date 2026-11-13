@@ -77,6 +77,12 @@ pub struct Sha256Context {
     hasher: Sha256,
 }
 
+impl Default for Sha256Context {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sha256Context {
     pub fn new() -> Self {
         Self {
