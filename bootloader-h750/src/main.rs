@@ -448,11 +448,12 @@ fn main() -> ! {
     let mut boot_slot = cand1;
     let mut verified_res = loader.load_and_verify(cand1, ram_target, false);
 
-    if verified_res.is_err() && cand2.is_some() {
-        let fallback_slot = cand2.unwrap();
-        uart_write_str("[BL] Primary candidate failed. Trying fallback slot.\r\n");
-        boot_slot = fallback_slot;
-        verified_res = loader.load_and_verify(fallback_slot, ram_target, false);
+    if verified_res.is_err() {
+        if let Some(fallback_slot) = cand2 {
+            uart_write_str("[BL] Primary candidate failed. Trying fallback slot.\r\n");
+            boot_slot = fallback_slot;
+            verified_res = loader.load_and_verify(fallback_slot, ram_target, false);
+        }
     }
 
     let parsed_img = match verified_res {
@@ -597,8 +598,8 @@ fn enter_rescue_mode(_reason: u8) -> ! {
 
                 let mut buf = [0u8; 512];
                 let to_read = len.min(512) as usize;
-                for i in 0..to_read {
-                    buf[i] = uart_read_byte_blocking();
+                for b in buf.iter_mut().take(to_read) {
+                    *b = uart_read_byte_blocking();
                 }
                 if nor.write(slot_base + offset, &buf[..to_read]).is_ok() {
                     uart_write_str("OK\r\n");

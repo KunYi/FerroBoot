@@ -257,15 +257,11 @@ pub fn parse_image<'a>(
                         image_type = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
                     }
                 }
-                IMAGE_TLV_BOARD_ID => {
-                    if val.len() == 4 {
-                        board_id = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
-                    }
+                IMAGE_TLV_BOARD_ID if val.len() == 4 => {
+                    board_id = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
                 }
-                IMAGE_TLV_MIN_BL_VERSION => {
-                    if val.len() == 4 {
-                        min_bl_version = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
-                    }
+                IMAGE_TLV_MIN_BL_VERSION if val.len() == 4 => {
+                    min_bl_version = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
                 }
                 _ => {
                     // Unknown protected TLV is ignored unless critical range
@@ -337,12 +333,10 @@ pub fn parse_image<'a>(
                         sig_type = entry.it_type;
                         signature = Some(val);
                     }
-                    IMAGE_TLV_ENC_INFO => {
-                        if val.len() >= core::mem::size_of::<EncInfoTlv>() {
-                            let (enc_ref, _) = EncInfoTlv::ref_from_prefix(val)
-                                .map_err(|_| ImageParseError::CorruptedTlvEntry)?;
-                            enc_info = Some(*enc_ref);
-                        }
+                    IMAGE_TLV_ENC_INFO if val.len() >= core::mem::size_of::<EncInfoTlv>() => {
+                        let (enc_ref, _) = EncInfoTlv::ref_from_prefix(val)
+                            .map_err(|_| ImageParseError::CorruptedTlvEntry)?;
+                        enc_info = Some(*enc_ref);
                     }
                     _ => {}
                 }

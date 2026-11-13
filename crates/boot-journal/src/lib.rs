@@ -189,8 +189,8 @@ impl JournalManager {
         let hdr0 = JournalSectorHeader::ref_from_prefix(&hdr0_buf).ok().map(|(h, _)| *h);
         let hdr1 = JournalSectorHeader::ref_from_prefix(&hdr1_buf).ok().map(|(h, _)| *h);
 
-        let v0 = hdr0.map_or(false, |h| h.is_valid());
-        let v1 = hdr1.map_or(false, |h| h.is_valid());
+        let v0 = hdr0.is_some_and(|h| h.is_valid());
+        let v1 = hdr1.is_some_and(|h| h.is_valid());
 
         let (active_addr, generation) = match (v0, v1) {
             (true, true) => {

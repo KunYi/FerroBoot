@@ -7,8 +7,8 @@
 
 use boot_abi::{
     BOOT_SLOT_A, BOOT_SLOT_B, ERR_DECRYPT_FAILED, ERR_INVALID_PARAM, ERR_VERIFY_FAILED,
-    NOR_SLOT_A_OFFSET, NOR_SLOT_B_OFFSET, SLOT_STATE_CONFIRMED, SLOT_STATE_EMPTY,
-    SLOT_STATE_INVALID, SLOT_STATE_PENDING, SLOT_STATE_TESTING,
+    NOR_SLOT_A_OFFSET, NOR_SLOT_B_OFFSET, SLOT_STATE_CONFIRMED,
+    SLOT_STATE_PENDING, SLOT_STATE_TESTING,
 };
 use boot_crypto::{
     ct_equal, derive_device_key, verify_p256_signature, xchacha20_process, KeyTable,
@@ -90,7 +90,7 @@ fn is_slot_bootable(s: &SlotJournalState, max_trials: u8) -> bool {
         SLOT_STATE_PENDING => true,
         SLOT_STATE_TESTING => s.trial < max_trials,
         SLOT_STATE_CONFIRMED => true,
-        SLOT_STATE_EMPTY | SLOT_STATE_INVALID | _ => false,
+        _ => false,
     }
 }
 
@@ -344,7 +344,6 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         let board_id = parsed.board_id;
         let min_bl_version = parsed.min_bl_version;
         let enc_info = parsed.enc_info;
-        drop(parsed);
 
         // Check hash
         if !ct_equal(&calculated_hash, &expected_hash) {
@@ -355,15 +354,16 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         // Check signature against matching key in keytable
         let mut key_found = false;
         for key_slot in &self.keytable.keys {
-            if key_slot.pubkey_len > 0 && ct_equal(&key_slot.keyhash, &expected_keyhash) {
-                if verify_p256_signature(
+            if key_slot.pubkey_len > 0
+                && ct_equal(&key_slot.keyhash, &expected_keyhash)
+                && verify_p256_signature(
                     &calculated_hash,
                     &key_slot.pubkey[..key_slot.pubkey_len as usize],
                     &sig_buf[..sig_len],
-                ).is_ok() {
-                    key_found = true;
-                    break;
-                }
+                ).is_ok()
+            {
+                key_found = true;
+                break;
             }
         }
         if !key_found {
