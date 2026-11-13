@@ -9,6 +9,7 @@ pub mod board;
 
 use board::*;
 use boot_abi::{SRAM4_BASE, SRAM4_SIZE, TAMP_CMD_ENTER_RESCUE};
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use stm32_metapac as pac;
 
@@ -307,6 +308,45 @@ pub fn init_millis() {
     unsafe {
         cortex_m::interrupt::enable();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt-free millisecond clock for the bootloader (DWT cycle counter)
+// ---------------------------------------------------------------------------
+
+struct PollClock(UnsafeCell<boot_time::MillisClock>);
+
+// SAFETY: the bootloader is single-threaded and runs with interrupts disabled;
+// `poll_millis` is never called from an interrupt handler.
+unsafe impl Sync for PollClock {}
+
+static POLL_CLOCK: PollClock = PollClock(UnsafeCell::new(boot_time::MillisClock::start(0)));
+
+/// Starts the DWT cycle counter and the polled millisecond clock.
+///
+/// Unlike `init_millis()` this uses **no interrupt**, so it is the clock the bootloader
+/// (and the ABI services it exports) rely on for NOR busy-wait timeouts. Call after
+/// `init_clocks()` **and after `init_sram4_ecc()`** (which zeroes all of SRAM4, including the
+/// clock state kept in this crate's `.bss`). Disable nothing on exit: the application that wants a SysTick tick calls
+/// `init_millis()` itself, and the DWT counter keeps running harmlessly.
+pub fn init_poll_millis() {
+    let mut cp = unsafe { cortex_m::Peripherals::steal() };
+    // Cortex-M7 (STM32H7) may software-lock the DWT after a power cycle.
+    cortex_m::peripheral::DWT::unlock();
+    cp.DCB.enable_trace();
+    cp.DWT.enable_cycle_counter();
+    unsafe {
+        *POLL_CLOCK.0.get() =
+            boot_time::MillisClock::start(cortex_m::peripheral::DWT::cycle_count());
+    }
+}
+
+/// Milliseconds since `init_poll_millis()`; wraps after 49.7 days (use `wrapping_sub`).
+///
+/// Must be polled at least once every ~10 s (400 MHz counter wrap); every NOR operation does.
+pub fn poll_millis() -> u32 {
+    let now = cortex_m::peripheral::DWT::cycle_count();
+    unsafe { (*POLL_CLOCK.0.get()).advance(now, CORE_CLOCK_HZ / 1000) }
 }
 
 /// Polling SPI1 driver for NOR Flash.

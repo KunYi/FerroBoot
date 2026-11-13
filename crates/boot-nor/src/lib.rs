@@ -160,7 +160,7 @@ impl<'a> SpiNorIoOpsDriver<'a> {
         self.write_cmd(&[CMD_RESET])?;
         // Wait at least 0.5ms after reset
         let start = unsafe { (self.io.millis)() };
-        while unsafe { (self.io.millis)() } - start < 1 {
+        while unsafe { (self.io.millis)() }.wrapping_sub(start) < 1 {
             unsafe { (self.io.yield_)() };
         }
         Ok(())
@@ -274,7 +274,7 @@ impl<'a> NorFlash for SpiNorIoOpsDriver<'a> {
             if (s1 & SR1_WIP) == 0 {
                 return Ok(());
             }
-            if unsafe { (self.io.millis)() } - start > timeout_ms {
+            if unsafe { (self.io.millis)() }.wrapping_sub(start) > timeout_ms {
                 return Err(NorError::Timeout);
             }
             unsafe { (self.io.yield_)() };
@@ -537,5 +537,121 @@ mod tests {
         let mut bad_rec = rec;
         bad_rec.seed[0] ^= 0x01;
         assert!(!bad_rec.is_valid());
+    }
+
+    // -----------------------------------------------------------------------
+    // Real driver (SpiNorIoOpsDriver) busy-wait / timeout behaviour.
+    // The RamNor mock never reports "busy", so these use a fake IoOps instead.
+    // -----------------------------------------------------------------------
+
+    extern crate std;
+    use core::cell::RefCell;
+    use std::thread_local;
+
+    #[derive(Default)]
+    struct Fake {
+        millis: u32,
+        millis_step: u32,
+        busy_polls: u32,
+        yields: u32,
+    }
+
+    thread_local! {
+        static FAKE: RefCell<Fake> = RefCell::new(Fake::default());
+    }
+
+    fn setup(millis: u32, millis_step: u32, busy_polls: u32) {
+        FAKE.with(|f| {
+            *f.borrow_mut() = Fake { millis, millis_step, busy_polls, yields: 0 };
+        });
+    }
+
+    unsafe extern "C" fn fake_spi(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
+        let tx = core::slice::from_raw_parts(tx, len as usize);
+        let rx = core::slice::from_raw_parts_mut(rx, len as usize);
+        rx.fill(0);
+        if tx[0] == CMD_READ_STATUS_1 && len >= 2 {
+            FAKE.with(|f| {
+                let mut f = f.borrow_mut();
+                if f.busy_polls > 0 {
+                    f.busy_polls -= 1;
+                    rx[1] = SR1_WIP;
+                }
+            });
+        }
+        0
+    }
+
+    unsafe extern "C" fn fake_cs(_assert: bool) {}
+
+    unsafe extern "C" fn fake_millis() -> u32 {
+        FAKE.with(|f| {
+            let mut f = f.borrow_mut();
+            let now = f.millis;
+            f.millis = f.millis.wrapping_add(f.millis_step);
+            now
+        })
+    }
+
+    unsafe extern "C" fn fake_yield() {
+        FAKE.with(|f| f.borrow_mut().yields += 1);
+    }
+
+    static FAKE_IO: IoOps = IoOps {
+        spi_transfer: fake_spi,
+        cs: fake_cs,
+        millis: fake_millis,
+        yield_: fake_yield,
+        reserved: [0; 4],
+    };
+
+    #[test]
+    fn wait_ready_returns_ok_once_device_is_idle() {
+        setup(1_000, 1, 5);
+        let mut nor = SpiNorIoOpsDriver::new(&FAKE_IO);
+        assert_eq!(nor.wait_ready(100), Ok(()));
+        assert!(FAKE.with(|f| f.borrow().yields) >= 5, "yields while busy");
+    }
+
+    #[test]
+    fn wait_ready_times_out_when_device_stays_busy() {
+        setup(1_000, 1, u32::MAX);
+        let mut nor = SpiNorIoOpsDriver::new(&FAKE_IO);
+        assert_eq!(nor.wait_ready(10), Err(NorError::Timeout));
+        // It must give up after roughly the timeout, not spin forever.
+        let elapsed = FAKE.with(|f| f.borrow().millis) - 1_000;
+        assert!((11..=14).contains(&elapsed), "elapsed {elapsed} ms");
+    }
+
+    #[test]
+    fn wait_ready_times_out_across_millis_wraparound() {
+        // Regression: `millis() - start` panicked (overflow-checks) when the
+        // millisecond counter wrapped between start and now.
+        setup(u32::MAX - 3, 1, u32::MAX);
+        let mut nor = SpiNorIoOpsDriver::new(&FAKE_IO);
+        assert_eq!(nor.wait_ready(20), Err(NorError::Timeout));
+    }
+
+    #[test]
+    fn wait_ready_succeeds_across_millis_wraparound() {
+        setup(u32::MAX - 3, 1, 8);
+        let mut nor = SpiNorIoOpsDriver::new(&FAKE_IO);
+        assert_eq!(nor.wait_ready(100), Ok(()));
+    }
+
+    #[test]
+    fn software_reset_returns_once_the_clock_has_advanced() {
+        // Regression: with a clock stuck at 0 the wait loop could never end.
+        setup(500, 1, 0);
+        let nor = SpiNorIoOpsDriver::new(&FAKE_IO);
+        assert_eq!(nor.software_reset(), Ok(()));
+        assert!(FAKE.with(|f| f.borrow().millis) >= 501, "clock was consulted");
+    }
+
+    #[test]
+    fn software_reset_survives_millis_wraparound() {
+        setup(u32::MAX, 1, 0);
+        let nor = SpiNorIoOpsDriver::new(&FAKE_IO);
+        assert_eq!(nor.software_reset(), Ok(()));
     }
 }

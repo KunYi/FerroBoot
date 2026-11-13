@@ -9,6 +9,7 @@ cortex-m = { workspace = true }
 stm32-metapac = { workspace = true, features = ["stm32h750vb", "pac"] }
 boot-abi = { workspace = true }
 boot-nor = { workspace = true }
+boot-time = { workspace = true }
 defmt = { workspace = true, optional = true }
 
 [features]

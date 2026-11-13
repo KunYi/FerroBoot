@@ -13,10 +13,9 @@ use boot_image::DEFAULT_BOARD_ID;
 use boot_journal::JournalManager;
 use boot_nor::{NorFlash, SpiNorIoOpsDriver};
 use boot_stm32h7::{
-    init_clocks, init_gpio_ui, init_nor_cs, init_spi1, init_sram4_ecc, init_usart1,
-    is_key2_pressed, jump_to_app, read_mcu_uid, set_led, set_nor_cs, spi1_transfer,
-    uart_read_byte_blocking, uart_write_byte, uart_write_hex, uart_write_str, Iwdg,
-    TampControl,
+    init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
+    init_usart1, is_key2_pressed, jump_to_app, poll_millis, read_mcu_uid, set_led, set_nor_cs,
+    spi1_transfer, uart_read_byte_blocking, uart_write_hex, uart_write_str, Iwdg, TampControl,
 };
 use cortex_m_rt::entry;
 use panic_halt as _;
@@ -145,10 +144,8 @@ unsafe extern "C" fn local_cs(assert: bool) {
     set_nor_cs(assert);
 }
 
-static mut SYSTEM_TICKS: u32 = 0;
-
 unsafe extern "C" fn local_millis() -> u32 {
-    SYSTEM_TICKS
+    poll_millis()
 }
 
 unsafe extern "C" fn local_yield() {
@@ -363,6 +360,9 @@ fn main() -> ! {
     // 1. Clock, SRAM4 ECC init, PA4 NOR CS High, UI, UART, SPI1
     init_clocks();
     init_sram4_ecc();
+    // Must come AFTER init_sram4_ecc(): it zeroes all of SRAM4, where the bootloader's own
+    // .bss (the poll clock state) lives. DWT only needs the core clock from init_clocks().
+    init_poll_millis();
     init_nor_cs();
     init_gpio_ui();
     init_usart1();

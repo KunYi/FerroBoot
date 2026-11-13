@@ -222,10 +222,15 @@ version = "0.1.0"
 dependencies = [
  "boot-abi",
  "boot-nor",
+ "boot-time",
  "cortex-m",
  "defmt",
  "stm32-metapac",
 ]
+
+[[package]]
+name = "boot-time"
+version = "0.1.0"
 
 [[package]]
 name = "boot-update"
