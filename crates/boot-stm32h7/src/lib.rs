@@ -8,7 +8,7 @@
 pub mod board;
 
 use board::*;
-use boot_abi::{SRAM4_BASE, SRAM4_SIZE, TAMP_CMD_ENTER_RESCUE};
+use boot_abi::TAMP_CMD_ENTER_RESCUE;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use stm32_metapac as pac;

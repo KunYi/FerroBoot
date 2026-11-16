@@ -4,11 +4,12 @@ use boot_abi::*;
 use boot_core::{decide, BootDecision, SlotLoader};
 use boot_crypto::{KeyTable, PublicKeySlot, KEYTABLE_MAGIC};
 use boot_image::{
-    DEFAULT_BOARD_ID, EXPECTED_HDR_SIZE, IMAGE_F_RAM_LOAD, IMAGE_MAGIC, IMAGE_TLV_BOARD_ID,
+    EXPECTED_HDR_SIZE, IMAGE_F_RAM_LOAD, IMAGE_MAGIC, IMAGE_TLV_BOARD_ID,
     IMAGE_TLV_ECDSA256, IMAGE_TLV_INFO_MAGIC, IMAGE_TLV_KEYHASH, IMAGE_TLV_PROT_INFO_MAGIC,
     IMAGE_TLV_SHA256,
 };
 use boot_journal::SlotJournalState;
+use boot_layout::H750_NETLITE;
 use boot_nor::{NorFlash, RamNor, SecureRegion, SeedRecord};
 use p256::ecdsa::SigningKey;
 use proptest::prelude::*;
@@ -33,7 +34,7 @@ fn create_test_signed_image(
 
     let header = boot_image::ImageHeader {
         ih_magic: IMAGE_MAGIC,
-        ih_load_addr: AXI_SRAM_BASE,
+        ih_load_addr: H750_NETLITE.load_addr().unwrap(),
         ih_hdr_size: EXPECTED_HDR_SIZE,
         ih_protect_tlv_size: prot_tlv_size,
         ih_img_size: img_size,
@@ -63,7 +64,7 @@ fn create_test_signed_image(
         it_len: 4,
     };
     output.extend_from_slice(board_entry.as_bytes());
-    output.extend_from_slice(&DEFAULT_BOARD_ID.to_le_bytes());
+    output.extend_from_slice(&H750_NETLITE.board_id.to_le_bytes());
 
     // Digest
     let mut hasher = Sha256::new();
@@ -104,8 +105,8 @@ fn test_end_to_end_nor_load_and_verification() {
     let (signed_image, _hash, keyhash, pubkey) = create_test_signed_image(&app_code, &signing_key);
 
     // Write signed image to Slot A
-    nor.erase_block_64k(NOR_SLOT_A_OFFSET).unwrap();
-    nor.write(NOR_SLOT_A_OFFSET, &signed_image).unwrap();
+    nor.erase_block_64k(H750_NETLITE.slots[0].offset).unwrap();
+    nor.write(H750_NETLITE.slots[0].offset, &signed_image).unwrap();
 
     // Key table with corresponding public key
     let keytable = KeyTable {
@@ -136,7 +137,7 @@ fn test_end_to_end_nor_load_and_verification() {
             &keytable,
             &global_secret,
             mcu_uid,
-            DEFAULT_BOARD_ID,
+            &H750_NETLITE,
             1,
         );
         let res = loader.load_and_verify(BOOT_SLOT_A, &mut ram_buf, false);
@@ -144,7 +145,7 @@ fn test_end_to_end_nor_load_and_verification() {
     }
 
     // Negative test: Corrupt 1 byte in NOR and verify rejection
-    nor.mem[(NOR_SLOT_A_OFFSET as usize) + 1024 + 10] ^= 0xFF;
+    nor.mem[(H750_NETLITE.slots[0].offset as usize) + 1024 + 10] ^= 0xFF;
 
     {
         let mut loader2 = SlotLoader::new(
@@ -152,7 +153,7 @@ fn test_end_to_end_nor_load_and_verification() {
             &keytable,
             &global_secret,
             mcu_uid,
-            DEFAULT_BOARD_ID,
+            &H750_NETLITE,
             1,
         );
         let corrupt_res = loader2.load_and_verify(BOOT_SLOT_A, &mut ram_buf, false);

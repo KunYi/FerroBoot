@@ -6,6 +6,10 @@ pub const HSE_FREQ_HZ: u32 = 25_000_000; // 25MHz external crystal
 pub const CORE_CLOCK_HZ: u32 = 400_000_000; // 400MHz VOS1
 pub const UART_BAUD_RATE: u32 = 115_200;
 
+// SRAM4 (D3 domain, 64 KiB, ECC): survives a reset and carries BootInfo / the rescue handshake.
+pub const SRAM4_BASE: u32 = 0x3800_0000;
+pub const SRAM4_SIZE: u32 = 64 * 1024;
+
 // SPI NOR Pins (SPI1)
 pub const PIN_NOR_CS_PORT: char = 'A';
 pub const PIN_NOR_CS_PIN: u8 = 4; // PA4 (Software CS, default HIGH)

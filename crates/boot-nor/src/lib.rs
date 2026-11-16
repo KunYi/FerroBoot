@@ -9,9 +9,16 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-use boot_abi::{IoOps, NOR_PAGE_SIZE};
+use boot_abi::IoOps;
 use boot_crc::Hasher;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+/// SPI NOR geometry (BY25Q32ES and compatible). These describe the *chip*, not the board.
+pub const NOR_PAGE_SIZE: u32 = 256;
+/// 4 KiB sector erase unit.
+pub const NOR_SECTOR_SIZE: u32 = 4096;
+/// 64 KiB block erase unit.
+pub const NOR_BLOCK_SIZE: u32 = 65536;
 
 pub const CMD_WRITE_ENABLE: u8 = 0x06;
 pub const CMD_WRITE_DISABLE: u8 = 0x04;

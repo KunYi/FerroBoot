@@ -10,6 +10,7 @@ std = ["boot-nor/std"]
 
 [dependencies]
 boot-abi = { workspace = true }
+boot-layout = { workspace = true }
 boot-nor = { workspace = true }
 boot-crc = { workspace = true }
 zerocopy = { workspace = true }

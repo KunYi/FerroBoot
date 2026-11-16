@@ -20,6 +20,7 @@ zeroize = { workspace = true }
 
 boot-abi = { workspace = true }
 boot-image = { workspace = true }
+boot-layout = { workspace = true }
 boot-crypto = { workspace = true }
 boot-nor = { workspace = true }
 boot-journal = { workspace = true }

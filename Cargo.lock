@@ -159,6 +159,7 @@ dependencies = [
  "boot-crypto",
  "boot-image",
  "boot-journal",
+ "boot-layout",
  "boot-nor",
  "p256",
  "proptest",
@@ -193,6 +194,7 @@ name = "boot-image"
 version = "0.1.0"
 dependencies = [
  "boot-abi",
+ "boot-layout",
  "hex",
  "zerocopy",
 ]
@@ -203,8 +205,16 @@ version = "0.1.0"
 dependencies = [
  "boot-abi",
  "boot-crc",
+ "boot-layout",
  "boot-nor",
  "zerocopy",
+]
+
+[[package]]
+name = "boot-layout"
+version = "0.1.0"
+dependencies = [
+ "boot-abi",
 ]
 
 [[package]]
@@ -241,6 +251,7 @@ dependencies = [
  "boot-crypto",
  "boot-image",
  "boot-journal",
+ "boot-layout",
  "boot-nor",
  "zerocopy",
  "zeroize",
@@ -255,6 +266,7 @@ dependencies = [
  "boot-crypto",
  "boot-image",
  "boot-journal",
+ "boot-layout",
  "boot-nor",
  "boot-stm32h7",
  "boot-update",
@@ -1492,6 +1504,7 @@ dependencies = [
  "boot-abi",
  "boot-crypto",
  "boot-image",
+ "boot-layout",
  "chacha20 0.9.1",
  "clap",
  "hex",

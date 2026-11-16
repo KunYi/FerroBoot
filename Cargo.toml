@@ -5,6 +5,7 @@ members = [
     "crates/boot-image",
     "crates/boot-crypto",
     "crates/boot-crc",
+    "crates/boot-layout",
     "crates/boot-time",
     "crates/boot-nor",
     "crates/boot-journal",
@@ -57,6 +58,7 @@ boot-abi = { path = "crates/boot-abi" }
 boot-image = { path = "crates/boot-image" }
 boot-crypto = { path = "crates/boot-crypto" }
 boot-crc = { path = "crates/boot-crc" }
+boot-layout = { path = "crates/boot-layout" }
 boot-time = { path = "crates/boot-time" }
 boot-nor = { path = "crates/boot-nor" }
 boot-journal = { path = "crates/boot-journal" }

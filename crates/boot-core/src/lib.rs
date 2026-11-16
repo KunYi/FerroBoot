@@ -7,8 +7,7 @@
 
 use boot_abi::{
     BOOT_SLOT_A, BOOT_SLOT_B, ERR_DECRYPT_FAILED, ERR_INVALID_PARAM, ERR_VERIFY_FAILED,
-    NOR_SLOT_A_OFFSET, NOR_SLOT_B_OFFSET, SLOT_STATE_CONFIRMED,
-    SLOT_STATE_PENDING, SLOT_STATE_TESTING,
+    SLOT_STATE_CONFIRMED, SLOT_STATE_PENDING, SLOT_STATE_TESTING,
 };
 use boot_crypto::{
     ct_equal, derive_device_key, verify_p256_signature, xchacha20_process, KeyTable,
@@ -16,6 +15,7 @@ use boot_crypto::{
 };
 use boot_image::{parse_image, ImageHeader, ParsedImage, ENC_SCHEME_DEVICE, HEADER_STRUCT_SIZE};
 use boot_journal::SlotJournalState;
+use boot_layout::Layout;
 use boot_nor::{NorFlash, SecureRegion};
 use zeroize::Zeroize;
 use zerocopy::FromBytes;
@@ -123,7 +123,7 @@ pub struct SlotLoader<'a, F: NorFlash + SecureRegion> {
     keytable: &'a KeyTable,
     global_secret: &'a [u8; 32],
     mcu_uid: [u8; 12],
-    expected_board_id: u32,
+    layout: &'a Layout,
     current_bl_version: u32,
 }
 
@@ -133,7 +133,7 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         keytable: &'a KeyTable,
         global_secret: &'a [u8; 32],
         mcu_uid: [u8; 12],
-        expected_board_id: u32,
+        layout: &'a Layout,
         current_bl_version: u32,
     ) -> Self {
         Self {
@@ -141,7 +141,7 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
             keytable,
             global_secret,
             mcu_uid,
-            expected_board_id,
+            layout,
             current_bl_version,
         }
     }
@@ -155,10 +155,9 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         ram_buffer: &mut [u8],
         require_encrypted: bool,
     ) -> Result<ParsedImage<'static>, i32> {
-        let slot_offset = match slot_id {
-            BOOT_SLOT_A => NOR_SLOT_A_OFFSET,
-            BOOT_SLOT_B => NOR_SLOT_B_OFFSET,
-            _ => return Err(ERR_INVALID_PARAM),
+        let slot_offset = match self.layout.slot(slot_id) {
+            Some(region) => region.offset,
+            None => return Err(ERR_INVALID_PARAM),
         };
 
         // 1. Read first 2KB from NOR (header and initial chunk)
@@ -205,7 +204,7 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
                 ERR_VERIFY_FAILED
             })?;
         let hdr = *hdr_ref;
-        if hdr.validate(boot_abi::NOR_SLOT_SIZE).is_err() {
+        if hdr.validate(self.layout).is_err() {
             device_key.zeroize();
             nor_seed.zeroize();
             return Err(ERR_VERIFY_FAILED);
@@ -255,7 +254,7 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         if hdr.is_encrypted() {
             let parsed_with_tlv = parse_image(
                 &ram_buffer[..hdr_size + img_size + tlv_len],
-                self.expected_board_id,
+                self.layout,
                 self.current_bl_version,
                 require_encrypted,
             );
@@ -299,7 +298,7 @@ impl<'a, F: NorFlash + SecureRegion> SlotLoader<'a, F> {
         // 6. Verify Signature against keytable
         let parse_res = parse_image(
             &ram_buffer[..hdr_size + img_size + tlv_len],
-            self.expected_board_id,
+            self.layout,
             self.current_bl_version,
             require_encrypted,
         );

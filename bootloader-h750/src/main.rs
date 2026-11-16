@@ -9,9 +9,9 @@
 use boot_abi::*;
 use boot_core::{decide, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
-use boot_image::DEFAULT_BOARD_ID;
 use boot_journal::JournalManager;
-use boot_nor::{NorFlash, SpiNorIoOpsDriver};
+use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE};
+use boot_nor::{NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
 use boot_stm32h7::{
     init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
     init_usart1, is_key2_pressed, jump_to_app, poll_millis, read_mcu_uid, set_led, set_nor_cs,
@@ -156,11 +156,25 @@ unsafe extern "C" fn local_yield() {
 // ABI Export Functions
 // ---------------------------------------------------------------------------
 
+/// The board layout this bootloader is built for (slots, journal, load/boot-info addresses).
+fn layout() -> &'static Layout {
+    &H750_NETLITE
+}
+
+/// RAM window the verified image is loaded into (this board uses the RAM-load model).
+fn ram_load_region() -> AddrRegion {
+    match layout().exec {
+        ExecModel::RamLoad { load, .. } => load,
+        #[allow(unreachable_patterns)]
+        _ => enter_rescue_mode(BOOT_REASON_ALL_INVALID),
+    }
+}
+
 unsafe extern "C" fn abi_get_boot_info(out: *mut BootInfo) -> i32 {
     if out.is_null() {
         return ERR_INVALID_PARAM;
     }
-    let src = SRAM4_BOOT_INFO_ADDR as *const BootInfo;
+    let src = layout().boot_info_addr as *const BootInfo;
     core::ptr::copy_nonoverlapping(src, out, 1);
     BOOT_OK
 }
@@ -171,7 +185,7 @@ unsafe extern "C" fn abi_slot_status(slot: u8, out: *mut SlotInfo) -> i32 {
     }
     // Replay journal with temporary driver
     let mut driver = SpiNorIoOpsDriver::new(&LOCAL_IO_OPS);
-    if let Ok(journal) = JournalManager::init(&mut driver) {
+    if let Ok(journal) = JournalManager::init(&mut driver, layout()) {
         let state = if slot == 0 { journal.slot_a } else { journal.slot_b };
         (*out).slot_id = slot;
         (*out).state = state.state;
@@ -189,16 +203,18 @@ unsafe extern "C" fn abi_slot_erase(io: *const IoOps, slot: u8) -> i32 {
         return ERR_INVALID_PARAM;
     }
     // Protect active slot (§8.3 rule 1)
-    let boot_info = &*(SRAM4_BOOT_INFO_ADDR as *const BootInfo);
+    let boot_info = &*(layout().boot_info_addr as *const BootInfo);
     if slot == boot_info.boot_slot {
         return ERR_ACTIVE_SLOT;
     }
 
     let mut driver = SpiNorIoOpsDriver::new(&*io);
-    let offset = if slot == 0 { NOR_SLOT_A_OFFSET } else { NOR_SLOT_B_OFFSET };
+    let Some(region) = layout().slot(slot) else {
+        return ERR_INVALID_PARAM;
+    };
 
-    for sec in 0..(NOR_SLOT_SIZE / NOR_SECTOR_SIZE) {
-        if driver.erase_sector_4k(offset + sec * NOR_SECTOR_SIZE).is_err() {
+    for sec in 0..(region.len / NOR_SECTOR_SIZE) {
+        if driver.erase_sector_4k(region.offset + sec * NOR_SECTOR_SIZE).is_err() {
             return ERR_NOR_IO;
         }
     }
@@ -215,16 +231,20 @@ unsafe extern "C" fn abi_slot_write(
     if io.is_null() || data.is_null() || slot > 1 {
         return ERR_INVALID_PARAM;
     }
-    let boot_info = &*(SRAM4_BOOT_INFO_ADDR as *const BootInfo);
+    let boot_info = &*(layout().boot_info_addr as *const BootInfo);
     if slot == boot_info.boot_slot {
         return ERR_ACTIVE_SLOT;
     }
-    if off + len > NOR_SLOT_SIZE {
+    let Some(region) = layout().slot(slot) else {
+        return ERR_INVALID_PARAM;
+    };
+    // u64 arithmetic: `off + len` must not wrap or panic for hostile arguments.
+    if off as u64 + len as u64 > region.len as u64 {
         return ERR_OUT_OF_BOUNDS;
     }
 
     let mut driver = SpiNorIoOpsDriver::new(&*io);
-    let slot_base = if slot == 0 { NOR_SLOT_A_OFFSET } else { NOR_SLOT_B_OFFSET };
+    let slot_base = region.offset;
     let slice = core::slice::from_raw_parts(data, len as usize);
 
     if driver.write(slot_base + off, slice).is_ok() {
@@ -250,7 +270,7 @@ unsafe extern "C" fn abi_verify_slot(
         &PUBLIC_KEY_TABLE,
         &SECRETS_STORAGE.global_secret,
         mcu_uid,
-        DEFAULT_BOARD_ID,
+        layout(),
         BOOTLOADER_INFO.bl_version,
     );
 
@@ -267,7 +287,7 @@ unsafe extern "C" fn abi_mark_pending(io: *const IoOps, slot: u8) -> i32 {
         return ERR_INVALID_PARAM;
     }
     let mut driver = SpiNorIoOpsDriver::new(&*io);
-    let mut journal = match JournalManager::init(&mut driver) {
+    let mut journal = match JournalManager::init(&mut driver, layout()) {
         Ok(j) => j,
         Err(_) => return ERR_NOR_IO,
     };
@@ -291,13 +311,13 @@ unsafe extern "C" fn abi_confirm(io: *const IoOps) -> i32 {
     if io.is_null() {
         return ERR_INVALID_PARAM;
     }
-    let boot_info = &*(SRAM4_BOOT_INFO_ADDR as *const BootInfo);
+    let boot_info = &*(layout().boot_info_addr as *const BootInfo);
     if boot_info.boot_slot > 1 {
         return ERR_INVALID_PARAM;
     }
 
     let mut driver = SpiNorIoOpsDriver::new(&*io);
-    let mut journal = match JournalManager::init(&mut driver) {
+    let mut journal = match JournalManager::init(&mut driver, layout()) {
         Ok(j) => j,
         Err(_) => return ERR_NOR_IO,
     };
@@ -411,7 +431,7 @@ fn main() -> ! {
     }
 
     // 4. Replay Journal
-    let mut journal = match JournalManager::init(&mut nor_driver) {
+    let mut journal = match JournalManager::init(&mut nor_driver, layout()) {
         Ok(j) => j,
         Err(_) => {
             uart_write_str("[BL] Journal init failed, entering rescue.\r\n");
@@ -437,13 +457,13 @@ fn main() -> ! {
         &PUBLIC_KEY_TABLE,
         &SECRETS_STORAGE.global_secret,
         mcu_uid,
-        DEFAULT_BOARD_ID,
+        layout(),
         BOOTLOADER_INFO.bl_version,
     );
 
-    let ram_target = unsafe {
-        core::slice::from_raw_parts_mut(AXI_SRAM_BASE as *mut u8, AXI_SRAM_SIZE as usize)
-    };
+    let load = ram_load_region();
+    let ram_target =
+        unsafe { core::slice::from_raw_parts_mut(load.base as *mut u8, load.len as usize) };
 
     let mut boot_slot = cand1;
     let mut verified_res = loader.load_and_verify(cand1, ram_target, false);
@@ -500,12 +520,12 @@ fn main() -> ! {
         crc32: 0,
     };
     unsafe {
-        core::ptr::write_volatile(SRAM4_BOOT_INFO_ADDR as *mut BootInfo, boot_info);
+        core::ptr::write_volatile(layout().boot_info_addr as *mut BootInfo, boot_info);
     }
 
     // 9. Jump to Application VTOR (0x24000400)
     unsafe {
-        jump_to_app(APP_VTOR_ADDR);
+        jump_to_app(layout().entry_vtor_addr());
     }
 }
 
@@ -556,11 +576,7 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                 while slot == b' ' || slot == b'\t' {
                     slot = uart_read_byte_blocking();
                 }
-                let base = if slot == b'0' {
-                    NOR_SLOT_A_OFFSET
-                } else {
-                    NOR_SLOT_B_OFFSET
-                };
+                let base = layout().slots[usize::from(slot != b'0')].offset;
                 if nor.erase_block_64k(base).is_ok() {
                     uart_write_str("OK\r\n");
                 } else {
@@ -573,11 +589,7 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                 while slot == b' ' || slot == b'\t' {
                     slot = uart_read_byte_blocking();
                 }
-                let slot_base = if slot == b'0' {
-                    NOR_SLOT_A_OFFSET
-                } else {
-                    NOR_SLOT_B_OFFSET
-                };
+                let slot_base = layout().slots[usize::from(slot != b'0')].offset;
                 let (offset, _) = match read_delimited_hex() {
                     (Some(o), d) => (o, d),
                     (None, _) => {
@@ -614,7 +626,7 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                     slot_char = uart_read_byte_blocking();
                 }
                 let slot_id = if slot_char == b'0' { 0 } else { 1 };
-                if let Ok(mut journal) = JournalManager::init(&mut nor) {
+                if let Ok(mut journal) = JournalManager::init(&mut nor, layout()) {
                     let res = journal.append_record(
                         &mut nor,
                         slot_id,

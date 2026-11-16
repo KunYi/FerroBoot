@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 boot-abi = { workspace = true }
+boot-layout = { workspace = true }
 zerocopy = { workspace = true }
 
 [dev-dependencies]

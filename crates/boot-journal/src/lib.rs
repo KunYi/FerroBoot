@@ -5,10 +5,9 @@
 
 #![no_std]
 
-use boot_abi::{
-    ImageVersion, NOR_JOURNAL_SECTOR_0, NOR_JOURNAL_SECTOR_1, NOR_SECTOR_SIZE, SLOT_STATE_EMPTY,
-};
-use boot_nor::{NorError, NorFlash};
+use boot_abi::{ImageVersion, SLOT_STATE_EMPTY};
+use boot_layout::Layout;
+use boot_nor::{NorError, NorFlash, NOR_SECTOR_SIZE};
 use boot_crc::Hasher;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -27,6 +26,8 @@ pub enum JournalError {
     Corrupted,
     NoValidSector,
     InvalidSlot,
+    /// The layout's journal regions are not 4 KiB erase units (the only unit supported today).
+    BadLayout,
 }
 
 impl From<NorError> for JournalError {
@@ -169,6 +170,10 @@ impl Default for SlotJournalState {
 }
 
 pub struct JournalManager {
+    /// The two ping-pong sector addresses, from `Layout::journal`.
+    sectors: [u32; 2],
+    /// Usable bytes per journal sector (`Layout::journal[..].len`).
+    sector_len: u32,
     pub active_sector_addr: u32,
     pub generation: u32,
     pub next_seq: u32,
@@ -179,12 +184,19 @@ pub struct JournalManager {
 
 impl JournalManager {
     /// Loads or initializes the journal across the ping-pong sectors.
-    pub fn init<F: NorFlash>(nor: &mut F) -> Result<Self, JournalError> {
+    pub fn init<F: NorFlash>(nor: &mut F, layout: &Layout) -> Result<Self, JournalError> {
+        let sectors = [layout.journal[0].offset, layout.journal[1].offset];
+        let sector_len = layout.journal[0].len;
+        // Erase/rollover use 4 KiB sector erases; reject any layout that disagrees.
+        if layout.journal[1].len != sector_len || sector_len != NOR_SECTOR_SIZE {
+            return Err(JournalError::BadLayout);
+        }
+
         let mut hdr0_buf = [0u8; 16];
         let mut hdr1_buf = [0u8; 16];
 
-        nor.read(NOR_JOURNAL_SECTOR_0, &mut hdr0_buf)?;
-        nor.read(NOR_JOURNAL_SECTOR_1, &mut hdr1_buf)?;
+        nor.read(sectors[0], &mut hdr0_buf)?;
+        nor.read(sectors[1], &mut hdr1_buf)?;
 
         let hdr0 = JournalSectorHeader::ref_from_prefix(&hdr0_buf).ok().map(|(h, _)| *h);
         let hdr1 = JournalSectorHeader::ref_from_prefix(&hdr1_buf).ok().map(|(h, _)| *h);
@@ -197,23 +209,25 @@ impl JournalManager {
                 let g0 = hdr0.unwrap().generation;
                 let g1 = hdr1.unwrap().generation;
                 if g0 >= g1 {
-                    (NOR_JOURNAL_SECTOR_0, g0)
+                    (sectors[0], g0)
                 } else {
-                    (NOR_JOURNAL_SECTOR_1, g1)
+                    (sectors[1], g1)
                 }
             }
-            (true, false) => (NOR_JOURNAL_SECTOR_0, hdr0.unwrap().generation),
-            (false, true) => (NOR_JOURNAL_SECTOR_1, hdr1.unwrap().generation),
+            (true, false) => (sectors[0], hdr0.unwrap().generation),
+            (false, true) => (sectors[1], hdr1.unwrap().generation),
             (false, false) => {
                 // Initialize clean journal on Sector 0
-                nor.erase_sector_4k(NOR_JOURNAL_SECTOR_0)?;
+                nor.erase_sector_4k(sectors[0])?;
                 let new_hdr = JournalSectorHeader::new(1);
-                nor.write(NOR_JOURNAL_SECTOR_0, new_hdr.as_bytes())?;
-                (NOR_JOURNAL_SECTOR_0, 1)
+                nor.write(sectors[0], new_hdr.as_bytes())?;
+                (sectors[0], 1)
             }
         };
 
         let mut mgr = Self {
+            sectors,
+            sector_len,
             active_sector_addr: active_addr,
             generation,
             next_seq: 1,
@@ -230,7 +244,7 @@ impl JournalManager {
         let mut buf = [0u8; RECORD_SIZE];
         let mut offset = 16u32;
 
-        while offset + (RECORD_SIZE as u32) <= NOR_SECTOR_SIZE {
+        while offset + (RECORD_SIZE as u32) <= self.sector_len {
             nor.read(self.active_sector_addr + offset, &mut buf)?;
             let (rec_ref, _) = match JournalRecord::ref_from_prefix(&buf) {
                 Ok(r) => r,
@@ -286,7 +300,7 @@ impl JournalManager {
         }
 
         // Check if sector full
-        if self.next_record_offset + (RECORD_SIZE as u32) > NOR_SECTOR_SIZE {
+        if self.next_record_offset + (RECORD_SIZE as u32) > self.sector_len {
             self.rollover(nor)?;
         }
 
@@ -328,10 +342,10 @@ impl JournalManager {
 
     /// Compacts current state into the backup sector and erases old sector.
     fn rollover<F: NorFlash>(&mut self, nor: &mut F) -> Result<(), JournalError> {
-        let other_addr = if self.active_sector_addr == NOR_JOURNAL_SECTOR_0 {
-            NOR_JOURNAL_SECTOR_1
+        let other_addr = if self.active_sector_addr == self.sectors[0] {
+            self.sectors[1]
         } else {
-            NOR_JOURNAL_SECTOR_0
+            self.sectors[0]
         };
 
         nor.erase_sector_4k(other_addr)?;
@@ -393,12 +407,13 @@ impl JournalManager {
 mod tests {
     use super::*;
     use boot_abi::*;
+    use boot_layout::H750_NETLITE;
     use boot_nor::RamNor;
 
     #[test]
     fn test_journal_init_and_state_transitions() {
         let mut nor = RamNor::new(64 * 1024);
-        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let mut mgr = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
 
         assert_eq!(mgr.slot_a.state, SLOT_STATE_EMPTY);
         assert_eq!(mgr.slot_b.state, SLOT_STATE_EMPTY);
@@ -427,7 +442,7 @@ mod tests {
         assert_eq!(mgr.slot_a.trial, 1);
 
         // Re-read journal from NOR to simulate reboot
-        let reloaded = JournalManager::init(&mut nor).unwrap();
+        let reloaded = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(reloaded.slot_a.state, SLOT_STATE_CONFIRMED);
         assert_eq!(reloaded.slot_a.trial, 1);
         assert_eq!(reloaded.slot_a.img_ver.major, 1);
@@ -436,7 +451,7 @@ mod tests {
     #[test]
     fn test_journal_rollover() {
         let mut nor = RamNor::new(64 * 1024);
-        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let mut mgr = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
 
         let v = ImageVersion::default();
         // Append records until rollover occurs
@@ -448,7 +463,7 @@ mod tests {
         assert!(mgr.generation > 1);
 
         // Verify that after reboot, the state is accurately recovered from the new active sector
-        let reloaded = JournalManager::init(&mut nor).unwrap();
+        let reloaded = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(reloaded.generation, mgr.generation);
         assert_eq!(reloaded.slot_a.state, mgr.slot_a.state);
     }
@@ -532,7 +547,7 @@ mod tests {
     #[test]
     fn power_cut_during_append_is_ignored_and_journal_stays_usable() {
         let mut nor = RamNor::new(64 * 1024);
-        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let mut mgr = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         mgr.append_record(&mut nor, 0, SLOT_STATE_WRITTEN, 0, 0, v1(), 1, 0).unwrap();
 
         // Cut power part-way through programming the next record.
@@ -542,40 +557,40 @@ mod tests {
 
         // "Reboot": power is back, the half-written record must be skipped.
         nor.fail_after_bytes = None;
-        let mut re = JournalManager::init(&mut nor).unwrap();
+        let mut re = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(re.slot_a.state, SLOT_STATE_WRITTEN, "torn record must not take effect");
         assert_eq!(re.next_record_offset, 16 + 2 * RECORD_SIZE as u32, "torn slot is skipped, not reused");
 
         // And the journal keeps working afterwards.
         re.append_record(&mut nor, 0, SLOT_STATE_PENDING, 0, 0, v1(), 1, 0).unwrap();
-        let again = JournalManager::init(&mut nor).unwrap();
+        let again = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(again.slot_a.state, SLOT_STATE_PENDING);
     }
 
     #[test]
     fn corrupted_record_crc_falls_back_to_previous_state() {
         let mut nor = RamNor::new(64 * 1024);
-        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let mut mgr = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         mgr.append_record(&mut nor, 0, SLOT_STATE_CONFIRMED, 0, 0, v1(), 1, 0).unwrap();
         mgr.append_record(&mut nor, 0, SLOT_STATE_TESTING, 1, 0, v1(), 1, 0).unwrap();
 
         // Flash can only clear bits: zero a CRC byte of the second record.
-        let crc_byte = NOR_JOURNAL_SECTOR_0 + 16 + RECORD_SIZE as u32 + 28;
+        let crc_byte = H750_NETLITE.journal[0].offset + 16 + RECORD_SIZE as u32 + 28;
         nor.write(crc_byte, &[0x00]).unwrap();
 
-        let re = JournalManager::init(&mut nor).unwrap();
+        let re = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
     }
 
     #[test]
     fn slots_are_tracked_independently() {
         let mut nor = RamNor::new(64 * 1024);
-        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let mut mgr = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         let v2 = ImageVersion { major: 2, minor: 0, revision: 0, build_num: 7 };
         mgr.append_record(&mut nor, 0, SLOT_STATE_CONFIRMED, 0, 0, v1(), 1, 0).unwrap();
         mgr.append_record(&mut nor, 1, SLOT_STATE_PENDING, 0, 0, v2, 2, 0x01).unwrap();
 
-        let re = JournalManager::init(&mut nor).unwrap();
+        let re = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
         assert_eq!(re.slot_a.img_ver, v1());
         assert_eq!(re.slot_b.state, SLOT_STATE_PENDING);
@@ -587,8 +602,38 @@ mod tests {
     #[test]
     fn invalid_slot_number_is_rejected() {
         let mut nor = RamNor::new(64 * 1024);
-        let mut mgr = JournalManager::init(&mut nor).unwrap();
+        let mut mgr = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         let res = mgr.append_record(&mut nor, 2, SLOT_STATE_PENDING, 0, 0, v1(), 1, 0);
         assert!(matches!(res, Err(JournalError::InvalidSlot)));
+    }
+
+    #[test]
+    fn layout_with_non_4k_journal_regions_is_rejected() {
+        let mut nor = RamNor::new(64 * 1024);
+        let mut bad = H750_NETLITE;
+        bad.journal[0].len = 8192;
+        assert!(matches!(JournalManager::init(&mut nor, &bad), Err(JournalError::BadLayout)));
+        let mut bad = H750_NETLITE;
+        bad.journal[1].len = 2048;
+        assert!(matches!(JournalManager::init(&mut nor, &bad), Err(JournalError::BadLayout)));
+    }
+
+    #[test]
+    fn journal_follows_the_layouts_sector_addresses() {
+        // Move the journal somewhere else: the data must land there and not at the H750 offsets.
+        let mut nor = RamNor::new(64 * 1024);
+        let mut moved = H750_NETLITE;
+        moved.journal = [
+            boot_layout::Region::new(0x4000, 4096),
+            boot_layout::Region::new(0x5000, 4096),
+        ];
+        let mut mgr = JournalManager::init(&mut nor, &moved).unwrap();
+        mgr.append_record(&mut nor, 0, SLOT_STATE_CONFIRMED, 0, 0, v1(), 1, 0).unwrap();
+        assert_eq!(mgr.active_sector_addr, 0x4000);
+        let mut at_h750 = [0u8; 16];
+        nor.read(H750_NETLITE.journal[0].offset, &mut at_h750).unwrap();
+        assert!(at_h750.iter().all(|&b| b == 0xFF), "nothing written at the old location");
+        let re = JournalManager::init(&mut nor, &moved).unwrap();
+        assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
     }
 }

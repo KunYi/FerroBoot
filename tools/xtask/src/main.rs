@@ -14,19 +14,31 @@ use std::path::PathBuf;
 use std::process::Command;
 use zerocopy::IntoBytes;
 
-use boot_abi::{ImageVersion, AXI_SRAM_BASE};
+use boot_abi::ImageVersion;
 use boot_image::{
-    EncInfoTlv, ImageHeader, ImageTlvEntry, ImageTlvInfo, DEFAULT_BOARD_ID, ENC_SCHEME_PROJECT,
+    EncInfoTlv, ImageHeader, ImageTlvEntry, ImageTlvInfo, ENC_SCHEME_PROJECT,
     EXPECTED_HDR_SIZE, IMAGE_F_ENCRYPTED, IMAGE_F_RAM_LOAD, IMAGE_MAGIC, IMAGE_TLV_BOARD_ID,
     IMAGE_TLV_ECDSA256, IMAGE_TLV_ENC_INFO, IMAGE_TLV_INFO_MAGIC, IMAGE_TLV_KEYHASH,
     IMAGE_TLV_PROT_INFO_MAGIC, IMAGE_TLV_SHA256,
 };
+use boot_layout::Layout;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Target board (selects the memory layout, board id and load address).
+    #[arg(long, global = true, default_value = "h750-netlite")]
+    board: String,
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Resolve `--board` to its layout, listing the known boards on a typo.
+fn resolve_board(name: &str) -> Result<&'static Layout, Box<dyn std::error::Error>> {
+    boot_layout::by_name(name).ok_or_else(|| {
+        let known: Vec<&str> = boot_layout::ALL.iter().map(|l| l.name).collect();
+        format!("unknown board '{}' (known: {})", name, known.join(", ")).into()
+    })
 }
 
 #[derive(Subcommand)]
@@ -64,6 +76,7 @@ enum Commands {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let layout = resolve_board(&cli.board)?;
 
     match cli.command {
         Commands::Sign {
@@ -75,6 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             build,
         } => {
             println!("[xtask] Signing binary: {:?}", bin);
+            let load_addr = layout
+                .load_addr()
+                .ok_or("selected board does not use a RAM-load execution model")?;
             let raw_data = fs::read(&bin)?;
 
             // Use test private key
@@ -92,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let header = ImageHeader {
                 ih_magic: IMAGE_MAGIC,
-                ih_load_addr: AXI_SRAM_BASE,
+                ih_load_addr: load_addr,
                 ih_hdr_size: EXPECTED_HDR_SIZE,
                 ih_protect_tlv_size: prot_tlv_size,
                 ih_img_size: img_size,
@@ -125,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 it_len: 4,
             };
             output.extend_from_slice(board_entry.as_bytes());
-            output.extend_from_slice(&DEFAULT_BOARD_ID.to_le_bytes());
+            output.extend_from_slice(&layout.board_id.to_le_bytes());
 
             // Compute SHA-256 over (Header + Body + Protected TLVs)
             let mut hasher = Sha256::new();

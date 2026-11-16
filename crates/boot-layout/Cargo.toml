@@ -1,0 +1,13 @@
+[package]
+name = "boot-layout"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Per-board memory/flash layout as pure const data (no HAL dependencies)"
+
+[dependencies]
+
+[dev-dependencies]
+# Migration guard only: proves the H750 numbers still equal the legacy boot-abi constants.
+# Removed together with those constants in the ABI v2 patch.
+boot-abi = { workspace = true }
