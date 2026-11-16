@@ -1,19 +1,26 @@
 # FerroBoot：BSP 分離與多平台（RAM_LOAD / XIP）擴展規劃
 
-> 狀態：**草案 v0.8，供討論**（尚未有任何程式碼變更）
-> 基準：上傳的 repo，HEAD = `10ba7bc fix(stm32h7): disable PLL1 before jumping to app`
+> 狀態：**草案 v0.9，供討論**（尚未有任何程式碼變更）
+> 基準：最初上傳的 repo 為 `10ba7bc`；**目前以 GitHub `KunYi/FerroBoot` 的 `main`（`22e097c`，2026-11-13）為準**，其中已包含 P0 的三個 patch
 > 範圍：把 `H750 NetLite（RAM_LOAD）` 與 `NUCLEO-F429ZI（內部 Flash XIP）` 放進同一個架構；`Forlinx OK1061-S（i.MX RT1061，FlexSPI NOR XIP）` 先在架構上預留、**後做**
 > 標註約定：**[已讀碼]** 來自原始碼；**[已查]** 本版以網路資料交叉查證過（來源見附錄 A，仍建議最後對照原廠手冊）；**[假設]** 我的推論；**[待查證]** 憑記憶，動工前必須對照手冊；**[TBD-n]** 你明確決定「拿到板子再定」的項目（§0.3）
 
+### v0.9 變更紀錄
+
+- **已對照 GitHub 最新版本**（`origin/main` = `22e097c`）：P0 的三個 patch 已併入，另有你加的 clippy 清理、`jump_to_app` 的 host 閘門、`spi1_transfer` 改 `unsafe`、刪除重複 plan 文件；在我的環境該版本 49 個測試全過、Bootloader 與 `app-template` 交叉建置無警告（`text` 36,920 B）。後續工作都以它為基礎。
+- **P1a 完成**：新增 `boot-layout`，並把 `&Layout` 傳進 `boot-journal`／`boot-image`／`boot-core`／`boot-update`／`xtask`／Bootloader；`xtask` 新增 `--board`。測試 **49 → 75**；`xtask sign` 輸出與重構前**逐 bit 相同**；`text` 36,920 → 37,128（+208 B）。
+- **新發現並修正兩個潛在 bug**，另記錄兩項觀察（§1.4）：空 chunk 會讓 `UpdateSession::feed_chunk` panic、`abi_slot_write` 的 `off + len` 以 `u32` 計算可能 wrap／panic；H750 實際的最大 image 是 512KiB（RAM 視窗）而不是 640KiB（slot）；`UpdateSession::finish()` 不驗簽就標記 Pending。
+- P1 剩下的部分（P1b）：ABI v2、移除 `boot-abi` 的舊位址常數、各 crate 獨立版本、`.secrets`／`.keytable` 位址進 `Layout`（§9、§12）。
+
 ### v0.8 變更紀錄
 
-- **P0 patch A 已完成並驗證**
+- **P0 patch A 已完成並驗證** 三個 patch 依序套用在 `10ba7bc` 上，host 測試 **12 → 49 個**全部通過；Bootloader 與 `app-template` 交叉建置無警告（§9）。
 - §1.4 更新：`local_millis` 已修；新增**兩項重要發現**：`init_sram4_ecc()` 會清零整個 SRAM4（含 Bootloader 自己的 `.bss`／`.data`／stack）、`overflow-checks` 下 `millis() - start` 會在計時器 wrap 時 panic。
 - 新增 **R-16**（Bootloader 的 RAM 靜態變數必須在 `init_sram4_ecc()` 之後初始化），並註記它與 TBD-1（RAM 常駐例程）的關聯。
 
 ### v0.7 變更紀錄
 
-- **P0 patch B（`boot-crc`）已完成並驗證** 實測 `text` 52,816 → 36,824 B（−15,992 B，−30%）（§7.2）。採用完整 256 項表（1KiB，編譯期算好、放在 flash，不佔 RAM）。
+- **P0 patch B（`boot-crc`）已完成並驗證**，以 git patch 交付（`0001-perf-bootloader-replace-crc32fast-with-boot-crc.patch`，可乾淨套用在 `10ba7bc`）。實測 `text` 52,816 → 36,824 B（−15,992 B，−30%）（§7.2）。採用完整 256 項表（1KiB，編譯期算好、放在 flash，不佔 RAM）。
 - 沙盒環境已建立 Rust 1.91 與 `arm-none-eabi-ld` 的交叉建置流程，之後的 patch 都能實際編譯、跑 host 測試與量 size（§12）。
 
 ### v0.6 變更紀錄
@@ -174,11 +181,17 @@ tools/xtask (sign/encrypt/size-check)   tools/host-update   tools/rescue_upload.
 
 ### 1.4 順便發現的問題（不屬本案，但 BSP 化時一定會碰到）
 
-- ✅ **`local_millis()` 永遠回傳 0 **：`bootloader-h750/src/main.rs` 的 `static mut SYSTEM_TICKS` 沒有任何地方遞增，Bootloader 階段沒有啟用 SysTick。後果比原本以為的更廣：(1) `wait_ready` 的逾時永遠不會觸發；(2) `software_reset()` 的「等 1 ms」迴圈 `while millis() - start < 1` 一旦被呼叫就**永遠不會結束**（目前 Bootloader 沒有呼叫它，所以沒有被觸發）；(3) release profile 開著 `overflow-checks`，`millis() - start` 在計時器 wrap 時會 **panic**。修法：新增 `boot-time`（可在 host 測試的 `MillisClock`）與 `boot-stm32h7` 的 `init_poll_millis()`／`poll_millis()`（DWT 週期計數器，**不使用中斷**，符合 D-08），`boot-nor` 改用 `wrapping_sub`。既有的 NOR 逾時（100／200／1000／3000 ms）都大於資料手冊最壞值（page 2.4 ms、4KB erase 300 ms、64KB erase 2000 ms），所以啟用真實時鐘不會在正常操作中引入新的逾時。
+- ✅ **`local_millis()` 永遠回傳 0（已修，patch 0002）**：`bootloader-h750/src/main.rs` 的 `static mut SYSTEM_TICKS` 沒有任何地方遞增，Bootloader 階段沒有啟用 SysTick。後果比原本以為的更廣：(1) `wait_ready` 的逾時永遠不會觸發；(2) `software_reset()` 的「等 1 ms」迴圈 `while millis() - start < 1` 一旦被呼叫就**永遠不會結束**（目前 Bootloader 沒有呼叫它，所以沒有被觸發）；(3) release profile 開著 `overflow-checks`，`millis() - start` 在計時器 wrap 時會 **panic**。修法：新增 `boot-time`（可在 host 測試的 `MillisClock`）與 `boot-stm32h7` 的 `init_poll_millis()`／`poll_millis()`（DWT 週期計數器，**不使用中斷**，符合 D-08），`boot-nor` 改用 `wrapping_sub`。既有的 NOR 逾時（100／200／1000／3000 ms）都大於資料手冊最壞值（page 2.4 ms、4KB erase 300 ms、64KB erase 2000 ms），所以啟用真實時鐘不會在正常操作中引入新的逾時。
 - ⚠️ **新發現：`init_sram4_ecc()` 會把整個 SRAM4（64KB）寫成 0**，而 Bootloader 自己的 `.bss`／`.data`／stack 都在 SRAM4（`memory.x` 的 `RAM` 起點 `0x38000100`）。目前能運作，是因為 `.data` 與 `.bss` 本來都是 0，且 `main` 在呼叫它時還沒有重要的 stack 內容。**任何新增的 RAM 靜態變數都必須在 `init_sram4_ecc()` 之後才初始化**（patch 0002 的 `init_poll_millis()` 就是這樣處理）。這也影響 TBD-1：若 F429／RT1061 將來需要把 Flash 例程複製到 RAM，複製必須排在對應的 RAM 初始化之後（R-16）。
 - 觀察（**不修改，只記錄**）：`JournalManager::init` 在兩個 journal sector 的 header 都無效時，會**擦除 sector 0 並重新建立空的 journal**。也就是說，若唯一有效的 header 因位元錯誤而失效，狀態會被整個重置（兩個 slot 都變 Empty → 進入救援）。這是設計上的選擇（fail-safe 進救援），但要知道有這個行為；`power_cut_during_append…` 等特性測試涵蓋了 record 層級的容錯，header 層級未改變。
+- ✅ **`UpdateSession::feed_chunk` 遇到空 chunk 會 panic（已修，patch 0004）**：`offset + len - 1` 在 `offset = 0`、`len = 0` 時 `u32` 下溢；release 開著 `overflow-checks`，Bootloader 會 panic（`panic-halt` = 卡死）。現在回傳 `ERR_INVALID_PARAM`，邊界檢查也改用 `u64`。
+- ✅ **`abi_slot_write` 的 `off + len > NOR_SLOT_SIZE` 以 `u32` 計算（已修，patch 0004）**：惡意或錯誤的參數可能 wrap 而繞過檢查，或在 `overflow-checks` 下 panic。現在以 `u64` 比較。
+- 觀察（**不修改，只記錄**）：H750 的**實際最大 image 是 512KiB（AXI SRAM 視窗），不是 640KiB（slot 大小）**，因為 `validate` 要求整份 image 放進 RAM。這已由 `h750_effective_image_limit_is_the_512k_ram_window_not_the_640k_slot` 測試固定。
+- 觀察（**不修改，只記錄**）：`UpdateSession::finish()` **不驗簽**就把 slot 標為 Pending（`_keytable` 沒有被使用）。目前不影響安全，因為下次開機 `load_and_verify` 會完整驗證，驗證失敗就回退；但「驗證通過才標記 Pending」這個 plan 原本的語意尚未實作，屬於 M5 的 `update_*` ABI 工作。`UpdateSession` 在 patch 0004 之前沒有任何測試，也沒有呼叫端。
+- 觀察：repo 根目錄的 `tests/integration_test.rs` 是 `crates/boot-core/tests/integration_test.rs` 的**舊版重複**，而且不屬於任何 package（工作區根目錄沒有 `[package]`），所以**不會被編譯或執行**；它已經引用了被移除的符號，建議直接刪除。
 - `jump_to_app` 沒有實作 plan.md §6.1 的 cache clean/invalidate、`CONTROL` 清除；目前因為沒開 cache 所以無妨，但 RT1061（M7 + cache）會要求。這會被正式化為 `Platform::prepare_jump()`。
 - README 已記載「UART 救援每個 slot 只擦第一個 64KB block」。救援協議目前以「64KB block」為單位，與 F429 的 128KB sector 不相容；救援協議應改為以「slot 相對偏移」表達、擦除粒度交給 `Flash`。
+- `docs/plan.md`（README 引用它，但在 git 中是**未追蹤**）與 `rust-bootloader-plan.md`（已追蹤）內容完全相同。建議：`git rm rust-bootloader-plan.md && git add docs/plan.md`。這一步**沒有放進 patch**，避免與你本機的狀態衝突。
 - 救援 `m` 指令寫入的版本號是寫死的 `1.0.0+1`。
 
 ---
@@ -755,7 +768,7 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 | 階段 | 內容 | DoD |
 |---|---|---|
 | **P0 基線與安全網** | 打 tag；記錄 H750 release 的 `.bin` hash/size；**size 組成分解已取得（§7.2）；`nm` 已驗證 `.rodata` 最大符號為 CRC 查表（0x4000）；在基線 tag 之後、作為獨立的一步，以 `boot-crc` 取代 `crc32fast`（同演算法，預期省約 15KiB），並以兩個板上 smoke test 與 host oracle 比對回歸**；host 測試全綠；補特性測試固定現有行為；**修 `local_millis`**（§1.4）；刪重複的 plan 文件。**狀態：patch 0001（`boot-crc`）、0002（時鐘）、0003（特性測試）已完成，等你在板上驗證；刪重複文件請依 §1.4 的兩行指令手動做** | 基線數據入庫；G0 的 log 存檔；板上 smoke test 通過 |
-| **P1 佈局資料化 + ABI v2** | 新增 `boot-layout`；`boot-journal`/`boot-update`/`boot-core`/`boot-image`/`xtask` 改吃 `&Layout`；`boot-abi` 位址常數搬走；ABI v2（§5.4）；移除 `version.workspace`（§6.6）；`.secrets`／`.keytable` 位址改由 `Layout` 提供 | host 測試全過且**測試語意不變**；H750 功能等價 |
+| **P1 佈局資料化 + ABI v2**（**P1a 已完成：patch 0004**；P1b 進行中） | 新增 `boot-layout`；`boot-journal`/`boot-update`/`boot-core`/`boot-image`/`xtask` 改吃 `&Layout`；`boot-abi` 位址常數搬走；ABI v2（§5.4）；移除 `version.workspace`（§6.6）；`.secrets`／`.keytable` 位址改由 `Layout` 提供 | host 測試全過且**測試語意不變**；H750 功能等價 |
 | **P2 Flash 抽象 + 救援全 slot** | 新增 `boot-flash`（trait + `RamFlash`：不均勻 sector、memory-mapped 讀、bank swap 映射模擬）；`boot-nor` 實作它；journal/update 以 erase unit 為單位；`boot-rescue` 以 slot 相對偏移、整個 slot 擦寫，加入 `s`（status）指令骨架（§5.6、§5.7） | 斷電注入在「均勻 4KB」與「F429 式不均勻＋bank swap」兩組幾何上都通過；H750 救援可上傳 > 64KB 的 image |
 | **P3 Platform 抽象與 bin 瘦身** | 新增 `boot-platform`、`boot-runtime`；`bootloader-h750/main.rs` 縮成板級 glue；`boot-stm32h7` 改名並分出 app-facing 子集，抽出 `boot-stm32-common`；目錄遷到 `boards/h750-netlite/`；`Platform::protection_status()` 先在 H750 實作（RDP） | H750 端到端與基線一致；`main.rs` ≤ 約 100 行 |
 | **P4 執行模型與驗證管線** | `ExecModel::{RamLoad, XipRemap}`；`SlotLoader` 拆為 `ImageSource → Decrypt? → Sink → Hash → Verify`；`VerifyPolicy`（首次試開機 Quick）與 `KIND_VERIFIED` journal 記錄（CRC 範圍全包含）；`DeviceBinding` 選配；XIP 的 host 模擬（含 remap） | RamLoad 路徑輸出與基線**位元一致**；XIP 的 host 模擬可跑完 test→confirm→revert |
@@ -822,17 +835,17 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 
 ## 12. 下一步行動
 
-目前**沒有開放的決策問題**。P0 的三個 patch 都已完成（見 §9 與 §1.4）。順序如下：
+目前**沒有開放的決策問題**。P0 與 P1a 已完成。順序如下：
 
 | 順序 | 行動 | 負責 | 狀態／說明 |
 |---|---|---|---|
-| 1 | ✅ 驗證 `.rodata` 最大符號 | 你 | `CRC32_TABLE` = 16,384 B |
-| 2 | ✅ 打基線 tag、提交 patch 0001 | 你 | 已回報提交 |
-| 3 | **套用 patch 0002、0003** | 你 | `git am 0002-*.patch 0003-*.patch`；host 測試 `cargo test`（預期 49 個通過，含 `boot-time` 9、`boot-nor` 9、`boot-journal` 10、`boot-core` 10） |
-| 4 | **板上 smoke test** | 你 | 載入 App 執行 + rescue 上傳。**特別觀察**：(a) UART 輸出與開機時間是否與之前一致；(b) 若方便，故意把 NOR 的 /CS 或 MISO 接壞，確認 Bootloader 現在會**逾時並進入錯誤路徑**而不是無限等待（選做）；(c) 貼上 `arm-none-eabi-size`（我這邊 `text` 36,928、`bss` 12） |
-| 5 | 手動整理文件：`git rm rust-bootloader-plan.md && git add docs/plan.md` | 你 | 見 §1.4 |
-| 6 | **P1：`boot-layout` 與 ABI v2** | 我 | 純重構；現在有 49 個 host 測試與黃金位元組當安全網 |
-| 7 | F429 spike S-F1～S-F3 | 你（需要板子）＋我寫測試程式 | G0 已通過，可以開始；S-F4 的 H750 數據已齊 |
+| 1 | ✅ P0（`boot-crc`、時鐘、特性測試） | 你 | 已併入 `main` |
+| 2 | **套用 patch 0004（P1a）** | 你 | `git am 0004-*.patch`；`cargo test`（預期 75 個通過）。我已在 `origin/main`（`22e097c`）的全新 clone 上驗證可乾淨套用 |
+| 3 | **板上 smoke test** | 你 | 載入 App 執行 + rescue 上傳。這個 patch 把位址常數改成從 `Layout` 讀取，**是重構中最需要實機確認的一步**：特別留意 (a) App 正常載入執行（`APP_VTOR_ADDR`、AXI SRAM 位址）；(b) rescue 上傳 slot 0／slot 1 都成功（slot 偏移）；(c) App 的 `get_boot_info`（`boot_info_addr`）。貼上 `arm-none-eabi-size`（我這邊 `text` 37,128） |
+| 4 | 選做：刪除根目錄 `tests/integration_test.rs` | 你 | 見 §1.4 的觀察 |
+| 5 | **P1b：ABI v2 與清理** | 我 | 移除 `boot-abi` 的舊位址常數（含 migration-guard 測試）、`IoOps.spi_transfer`／`cs` 改可選、`BootApi.caps`、`BlInfo` 新欄位、`BootApiClient::at(addr)`、`.secrets`／`.keytable` 位址進 `Layout`、移除 `version.workspace` |
+| 6 | P2：`boot-flash`（Flash trait）與救援全 slot | 我 | 見 §9 |
+| 7 | F429 spike S-F1～S-F3 | 你（需要板子）＋我寫測試程式 | G0 已通過，可以開始 |
 
 **補充**：沙盒有 Rust 1.91（host 測試）與 `arm-none-eabi-ld`（以 `-Zbuild-std` 交叉建置），所以 patch 都經過實際編譯、host 測試與 size 量測；**板上行為仍需你驗證**。
 
