@@ -1,9 +1,17 @@
 # FerroBoot：BSP 分離與多平台（RAM_LOAD / XIP）擴展規劃
 
-> 狀態：**草案 v0.9，供討論**（尚未有任何程式碼變更）
-> 基準：最初上傳的 repo 為 `10ba7bc`；**目前以 GitHub `KunYi/FerroBoot` 的 `main`（`22e097c`，2026-11-13）為準**，其中已包含 P0 的三個 patch
+> 狀態：**草案 v0.10，供討論**（尚未有任何程式碼變更）
+> 基準：最初上傳的 repo 為 `10ba7bc`；**目前以 GitHub `KunYi/FerroBoot` 的 `main`（`12536f5`，2026-11-16）為準**，其中已包含 P0 的三個 patch 與 P1a patch
 > 範圍：把 `H750 NetLite（RAM_LOAD）` 與 `NUCLEO-F429ZI（內部 Flash XIP）` 放進同一個架構；`Forlinx OK1061-S（i.MX RT1061，FlexSPI NOR XIP）` 先在架構上預留、**後做**
 > 標註約定：**[已讀碼]** 來自原始碼；**[已查]** 本版以網路資料交叉查證過（來源見附錄 A，仍建議最後對照原廠手冊）；**[假設]** 我的推論；**[待查證]** 憑記憶，動工前必須對照手冊；**[TBD-n]** 你明確決定「拿到板子再定」的項目（§0.3）
+
+### v0.10 變更紀錄
+
+- **已重新對照 GitHub 最新版本**（`origin/main` = `12536f5`）：你已併入 P1a並完成實機驗證；程式碼與我的分支完全一致。
+- **P1 完成** ：**ABI v2**（`IoOps` 的 SPI 傳輸改為可選、`BootApi.caps`、`BlInfo` 平台欄位、`BootApiClient::at(addr)`）、`boot-abi` 不再含任何板級位址、`Layout` 帶 `bl_info`／`boot_api`／`secrets`／`keytable` 位址並與 `memory.x` 做**防漂移測試**、各 crate 獨立版本與 `docs/compat.md`、Application Boot API Guide 更新為 v2。測試 **75 → 81**；`text` 37,128 → 37,284。
+- **新發現並修正一個 bug**：多個 NOR 操作在 SPI 傳輸失敗時**提前返回而 chip select 仍維持拉低**（頁寫入、`read_unique_id`、`read/program_security_register`）。已修，並以「逐一讓第 N 次傳輸失敗」的測試掃過每個操作（已用變異測試確認會抓到）。
+- 直接檢查建置出的 ELF：`.boot_api` 在 `0x08000440`（`abi_version=2`、12 個項目、`caps=0x21`）、`.bl_info` 在 `0x08000400`（`platform_id='H750'`）。
+- 下一步是 **P2**（`Flash` trait 與救援全 slot）。
 
 ### v0.9 變更紀錄
 
@@ -20,7 +28,7 @@
 
 ### v0.7 變更紀錄
 
-- **P0 patch B（`boot-crc`）已完成並驗證**，以 git patch 交付（`0001-perf-bootloader-replace-crc32fast-with-boot-crc.patch`，可乾淨套用在 `10ba7bc`）。實測 `text` 52,816 → 36,824 B（−15,992 B，−30%）（§7.2）。採用完整 256 項表（1KiB，編譯期算好、放在 flash，不佔 RAM）。
+- **P0 patch B（`boot-crc`）已完成並驗證**，實測 `text` 52,816 → 36,824 B（−15,992 B，−30%）（§7.2）。採用完整 256 項表（1KiB，編譯期算好、放在 flash，不佔 RAM）。
 - 沙盒環境已建立 Rust 1.91 與 `arm-none-eabi-ld` 的交叉建置流程，之後的 patch 都能實際編譯、跑 host 測試與量 size（§12）。
 
 ### v0.6 變更紀錄
@@ -186,6 +194,7 @@ tools/xtask (sign/encrypt/size-check)   tools/host-update   tools/rescue_upload.
 - 觀察（**不修改，只記錄**）：`JournalManager::init` 在兩個 journal sector 的 header 都無效時，會**擦除 sector 0 並重新建立空的 journal**。也就是說，若唯一有效的 header 因位元錯誤而失效，狀態會被整個重置（兩個 slot 都變 Empty → 進入救援）。這是設計上的選擇（fail-safe 進救援），但要知道有這個行為；`power_cut_during_append…` 等特性測試涵蓋了 record 層級的容錯，header 層級未改變。
 - ✅ **`UpdateSession::feed_chunk` 遇到空 chunk 會 panic（已修，patch 0004）**：`offset + len - 1` 在 `offset = 0`、`len = 0` 時 `u32` 下溢；release 開著 `overflow-checks`，Bootloader 會 panic（`panic-halt` = 卡死）。現在回傳 `ERR_INVALID_PARAM`，邊界檢查也改用 `u64`。
 - ✅ **`abi_slot_write` 的 `off + len > NOR_SLOT_SIZE` 以 `u32` 計算（已修，patch 0004）**：惡意或錯誤的參數可能 wrap 而繞過檢查，或在 `overflow-checks` 下 panic。現在以 `u64` 比較。
+- ✅ **NOR 操作失敗時 chip select 仍拉低（已修）**：`SpiNorIoOpsDriver` 的 `write`（頁寫入）、`read_unique_id`、`read_security_register`、`program_security_register` 在 SPI 傳輸失敗時用 `?` 提前返回，而前面已 `cs(true)`；匯流排上的 NOR 會一直被選中。現在一律先釋放 CS 再返回。`program_security_register` 對超過 256 bytes 的資料也改為回傳錯誤，而不是切片越界 panic。
 - 觀察（**不修改，只記錄**）：H750 的**實際最大 image 是 512KiB（AXI SRAM 視窗），不是 640KiB（slot 大小）**，因為 `validate` 要求整份 image 放進 RAM。這已由 `h750_effective_image_limit_is_the_512k_ram_window_not_the_640k_slot` 測試固定。
 - 觀察（**不修改，只記錄**）：`UpdateSession::finish()` **不驗簽**就把 slot 標為 Pending（`_keytable` 沒有被使用）。目前不影響安全，因為下次開機 `load_and_verify` 會完整驗證，驗證失敗就回退；但「驗證通過才標記 Pending」這個 plan 原本的語意尚未實作，屬於 M5 的 `update_*` ABI 工作。`UpdateSession` 在 patch 0004 之前沒有任何測試，也沒有呼叫端。
 - 觀察：repo 根目錄的 `tests/integration_test.rs` 是 `crates/boot-core/tests/integration_test.rs` 的**舊版重複**，而且不屬於任何 package（工作區根目錄沒有 `[package]`），所以**不會被編譯或執行**；它已經引用了被移除的符號，建議直接刪除。
@@ -768,7 +777,7 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 | 階段 | 內容 | DoD |
 |---|---|---|
 | **P0 基線與安全網** | 打 tag；記錄 H750 release 的 `.bin` hash/size；**size 組成分解已取得（§7.2）；`nm` 已驗證 `.rodata` 最大符號為 CRC 查表（0x4000）；在基線 tag 之後、作為獨立的一步，以 `boot-crc` 取代 `crc32fast`（同演算法，預期省約 15KiB），並以兩個板上 smoke test 與 host oracle 比對回歸**；host 測試全綠；補特性測試固定現有行為；**修 `local_millis`**（§1.4）；刪重複的 plan 文件。**狀態：patch 0001（`boot-crc`）、0002（時鐘）、0003（特性測試）已完成，等你在板上驗證；刪重複文件請依 §1.4 的兩行指令手動做** | 基線數據入庫；G0 的 log 存檔；板上 smoke test 通過 |
-| **P1 佈局資料化 + ABI v2**（**P1a 已完成：patch 0004**；P1b 進行中） | 新增 `boot-layout`；`boot-journal`/`boot-update`/`boot-core`/`boot-image`/`xtask` 改吃 `&Layout`；`boot-abi` 位址常數搬走；ABI v2（§5.4）；移除 `version.workspace`（§6.6）；`.secrets`／`.keytable` 位址改由 `Layout` 提供 | host 測試全過且**測試語意不變**；H750 功能等價 |
+| **P1 佈局資料化 + ABI v2**（✅ **完成：patch 0004、0005、0006**） | 新增 `boot-layout`；`boot-journal`/`boot-update`/`boot-core`/`boot-image`/`xtask` 改吃 `&Layout`；`boot-abi` 位址常數搬走；ABI v2（§5.4）；移除 `version.workspace`（§6.6）；`.secrets`／`.keytable` 位址改由 `Layout` 提供 | host 測試全過且**測試語意不變**；H750 功能等價 |
 | **P2 Flash 抽象 + 救援全 slot** | 新增 `boot-flash`（trait + `RamFlash`：不均勻 sector、memory-mapped 讀、bank swap 映射模擬）；`boot-nor` 實作它；journal/update 以 erase unit 為單位；`boot-rescue` 以 slot 相對偏移、整個 slot 擦寫，加入 `s`（status）指令骨架（§5.6、§5.7） | 斷電注入在「均勻 4KB」與「F429 式不均勻＋bank swap」兩組幾何上都通過；H750 救援可上傳 > 64KB 的 image |
 | **P3 Platform 抽象與 bin 瘦身** | 新增 `boot-platform`、`boot-runtime`；`bootloader-h750/main.rs` 縮成板級 glue；`boot-stm32h7` 改名並分出 app-facing 子集，抽出 `boot-stm32-common`；目錄遷到 `boards/h750-netlite/`；`Platform::protection_status()` 先在 H750 實作（RDP） | H750 端到端與基線一致；`main.rs` ≤ 約 100 行 |
 | **P4 執行模型與驗證管線** | `ExecModel::{RamLoad, XipRemap}`；`SlotLoader` 拆為 `ImageSource → Decrypt? → Sink → Hash → Verify`；`VerifyPolicy`（首次試開機 Quick）與 `KIND_VERIFIED` journal 記錄（CRC 範圍全包含）；`DeviceBinding` 選配；XIP 的 host 模擬（含 remap） | RamLoad 路徑輸出與基線**位元一致**；XIP 的 host 模擬可跑完 test→confirm→revert |
@@ -835,17 +844,16 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 
 ## 12. 下一步行動
 
-目前**沒有開放的決策問題**。P0 與 P1a 已完成。順序如下：
+目前**沒有開放的決策問題**。P0 與 P1 已完成。順序如下：
 
 | 順序 | 行動 | 負責 | 狀態／說明 |
 |---|---|---|---|
-| 1 | ✅ P0（`boot-crc`、時鐘、特性測試） | 你 | 已併入 `main` |
-| 2 | **套用 patch 0004（P1a）** | 你 | `git am 0004-*.patch`；`cargo test`（預期 75 個通過）。我已在 `origin/main`（`22e097c`）的全新 clone 上驗證可乾淨套用 |
-| 3 | **板上 smoke test** | 你 | 載入 App 執行 + rescue 上傳。這個 patch 把位址常數改成從 `Layout` 讀取，**是重構中最需要實機確認的一步**：特別留意 (a) App 正常載入執行（`APP_VTOR_ADDR`、AXI SRAM 位址）；(b) rescue 上傳 slot 0／slot 1 都成功（slot 偏移）；(c) App 的 `get_boot_info`（`boot_info_addr`）。貼上 `arm-none-eabi-size`（我這邊 `text` 37,128） |
-| 4 | 選做：刪除根目錄 `tests/integration_test.rs` | 你 | 見 §1.4 的觀察 |
-| 5 | **P1b：ABI v2 與清理** | 我 | 移除 `boot-abi` 的舊位址常數（含 migration-guard 測試）、`IoOps.spi_transfer`／`cs` 改可選、`BootApi.caps`、`BlInfo` 新欄位、`BootApiClient::at(addr)`、`.secrets`／`.keytable` 位址進 `Layout`、移除 `version.workspace` |
-| 6 | P2：`boot-flash`（Flash trait）與救援全 slot | 我 | 見 §9 |
-| 7 | F429 spike S-F1～S-F3 | 你（需要板子）＋我寫測試程式 | G0 已通過，可以開始 |
+| 1 | ✅ P0（`boot-crc`、時鐘、特性測試）、✅ P1a（patch 0004） | 你 | 已併入 `main` 並實機驗證 |
+| 2 | **套用 patch 0005、0006（P1b）** | 你 | `git am 0005-*.patch 0006-*.patch`；`cargo test`（預期 81 個通過）。我已在 `origin/main`（`12536f5`）的全新 clone 上驗證可乾淨套用，並完成兩個交叉建置（`text` 37,284） |
+| 3 | **板上 smoke test** | 你 | 載入 App 執行 + rescue 上傳。這一步改變了 **ABI 的二進位內容**（`IoOps` 用 `Option`、`BootApi.caps`、`BlInfo` 欄位）與 NOR 驅動的 CS 處理，請特別確認：(a) App 能連上 Bootloader ABI（`BootApiClient::at` 現在還會檢查 `abi_version == 2`，**舊版 App 韌體與新版 Bootloader 不相容，需要一起更新**）；(b) `get_boot_info`／`slot_status` 正常；(c) rescue 上傳 slot 0／1 成功；(d) 若有做 App 端 OTA（`slot_erase`／`slot_write`／`verify_slot`／`mark_pending`），照常運作 |
+| 4 | 選做：刪除根目錄 `tests/integration_test.rs` | 你 | 舊的重複檔，不會被編譯（§1.4） |
+| 5 | **P2：`boot-flash`（Flash trait）與救援全 slot** | 我 | 見 §9：`Flash` trait（含不均勻 sector）、`RamFlash` 的 bank-swap 模擬、journal／update 以 erase unit 為單位、`boot-rescue` 以 slot 相對偏移擦寫整個 slot、`slot_erase_step()` |
+| 6 | F429 spike S-F1～S-F3 | 你（需要板子）＋我寫測試程式 | G0 已通過，可以開始 |
 
 **補充**：沙盒有 Rust 1.91（host 測試）與 `arm-none-eabi-ld`（以 `-Zbuild-std` 交叉建置），所以 patch 都經過實際編譯、host 測試與 size 量測；**板上行為仍需你驗證**。
 
@@ -902,7 +910,7 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 
 | 常數 | 去向 |
 |---|---|
-| `FLASH_BASE_ADDR`, `BL_INFO_ADDR`, `BOOT_API_ADDR`, `SECRETS_ADDR`, `KEYTABLE_ADDR`, `VECTOR_TABLE_SIZE` | `Layout`（每板） |
+| `FLASH_BASE_ADDR`, `BL_INFO_ADDR`, `BOOT_API_ADDR`, `SECRETS_ADDR`, `KEYTABLE_ADDR`, `VECTOR_TABLE_SIZE` | ✅ 已移入 `Layout`（`bl_info_addr`／`boot_api_addr`／`secrets_addr`／`keytable_addr`；`FLASH_BASE`／`VECTOR_TABLE_SIZE` 已刪除，無使用者） |
 | `AXI_SRAM_BASE/SIZE`, `APP_LOAD_ADDR`, `APP_VTOR_OFFSET/ADDR` | `ExecModel::RamLoad`（H750） |
 | `SRAM4_BASE/SIZE`, `SRAM4_BOOT_INFO_ADDR` | `Layout.boot_info_addr` + H7 SoC crate（SRAM4 初始化） |
 | `NOR_JOURNAL_SECTOR_0/1`, `NOR_RESERVED_OFFSET`, `NOR_SLOT_A/B_OFFSET`, `NOR_SLOT_SIZE` | `Layout.journal/slots`（Flash 後端偏移） |
