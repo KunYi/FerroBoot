@@ -9,11 +9,11 @@
 use boot_abi::*;
 use boot_core::{decide, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
-use boot_journal::JournalManager;
+use boot_journal::{JournalManager, SlotJournalState};
 use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
 use boot_nor::{NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
 use boot_stm32h7::{
-    init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
+    uart_write_u32, init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
     init_usart1, is_key2_pressed, jump_to_app, poll_millis, read_mcu_uid, set_led, set_nor_cs,
     spi1_transfer, uart_read_byte_blocking, uart_write_hex, uart_write_str, Iwdg, TampControl,
 };
@@ -444,8 +444,24 @@ fn main() -> ! {
         }
     };
 
+    print_journal(&journal);
+
     // 5. Run Decision Engine
     let decision = decide(&journal.slot_a, &journal.slot_b, DEFAULT_MAX_TRIALS);
+    uart_write_str("[BL] decide: ");
+    match decision {
+        BootDecision::TryCandidates { primary, fallback } => {
+            uart_write_str("primary=");
+            uart_write_u32(u32::from(primary));
+            uart_write_str(" fallback=");
+            match fallback {
+                Some(f) => uart_write_u32(u32::from(f)),
+                None => uart_write_str("-"),
+            }
+        }
+        BootDecision::EnterRescue => uart_write_str("rescue"),
+    }
+    uart_write_str("\r\n");
 
     let (cand1, cand2) = match decision {
         BootDecision::TryCandidates { primary, fallback } => (primary, fallback),
@@ -495,7 +511,7 @@ fn main() -> ! {
     let target_state = if boot_slot == 0 { journal.slot_a } else { journal.slot_b };
     let is_trial = target_state.state == SLOT_STATE_PENDING;
     if is_trial {
-        let _ = journal.append_record(
+        let trial_res = journal.append_record(
             &mut nor_driver,
             boot_slot,
             SLOT_STATE_TESTING,
@@ -505,6 +521,12 @@ fn main() -> ! {
             0,
             0,
         );
+        // Diagnostic (E.1): a failed Testing record used to be dropped silently.
+        uart_write_str(if trial_res.is_ok() {
+            "[BL] Pending -> Testing recorded.\r\n"
+        } else {
+            "[BL] WARN: Pending -> Testing record FAILED.\r\n"
+        });
         // Start watchdog for test boot
         Iwdg::start(3000);
     }
@@ -532,6 +554,45 @@ fn main() -> ! {
     unsafe {
         jump_to_app(layout().entry_vtor_addr());
     }
+}
+
+fn print_slot_state(name: &str, s: &SlotJournalState) {
+    uart_write_str("[BL] J ");
+    uart_write_str(name);
+    uart_write_str(" state=");
+    uart_write_hex(s.state);
+    uart_write_str(" trial=");
+    uart_write_u32(u32::from(s.trial));
+    uart_write_str(" ver=");
+    uart_write_u32(u32::from(s.img_ver.major));
+    uart_write_str(".");
+    uart_write_u32(u32::from(s.img_ver.minor));
+    uart_write_str(".");
+    uart_write_u32(u32::from(s.img_ver.revision));
+    uart_write_str("+");
+    uart_write_u32(s.img_ver.build_num);
+    uart_write_str(" min_ver=");
+    uart_write_u32(s.min_version);
+    uart_write_str(" revoke=");
+    uart_write_hex(s.key_revoke_mask);
+    uart_write_str("\r\n");
+}
+
+/// Diagnostic dump of the replayed journal (plan E.1). Read-only.
+fn print_journal(j: &JournalManager) {
+    uart_write_str("[BL] J gen=");
+    uart_write_u32(j.generation);
+    uart_write_str(" next_seq=");
+    uart_write_u32(j.next_seq);
+    uart_write_str(" next_off=");
+    uart_write_u32(j.next_record_offset);
+    uart_write_str(" sector=0x");
+    for sh in [24u32, 16, 8, 0] {
+        uart_write_hex((j.active_sector_addr >> sh) as u8);
+    }
+    uart_write_str("\r\n");
+    print_slot_state("A", &j.slot_a);
+    print_slot_state("B", &j.slot_b);
 }
 
 fn read_delimited_hex() -> (Option<u32>, u8) {
@@ -654,6 +715,13 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                     }
                 } else {
                     uart_write_str("ERR_INIT\r\n");
+                }
+            }
+            b'j' | b'J' => {
+                // Journal dump (diagnostic, read-only)
+                match JournalManager::init(&mut nor, layout()) {
+                    Ok(journal) => print_journal(&journal),
+                    Err(_) => uart_write_str("ERR_INIT\r\n"),
                 }
             }
             b'r' | b'R' => {
