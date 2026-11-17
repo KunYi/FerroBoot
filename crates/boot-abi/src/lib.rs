@@ -9,7 +9,9 @@
 pub const BOOT_API_MAGIC: u32 = 0x4950_4142;
 
 /// Current ABI specification version.
-pub const BOOT_ABI_VERSION: u16 = 1;
+/// Version 2: `IoOps::spi_transfer`/`cs` optional, `BootApi::caps`, `BlInfo` platform fields,
+/// no board addresses in this crate. (Version 1 was never released.)
+pub const BOOT_ABI_VERSION: u16 = 2;
 
 /// Magic constant for `BootInfo`: ASCII 'INFO' in little-endian.
 pub const BOOT_INFO_MAGIC: u32 = 0x4F46_4E49;
@@ -17,35 +19,26 @@ pub const BOOT_INFO_MAGIC: u32 = 0x4F46_4E49;
 /// Magic constant for `BlInfo`: ASCII '.BLI' in little-endian.
 pub const BL_INFO_MAGIC: u32 = 0x494C_422E;
 
-// Fixed addresses in STM32H750 Flash (0x08000000, 128KB single sector)
-pub const FLASH_BASE_ADDR: u32 = 0x0800_0000;
-pub const VECTOR_TABLE_SIZE: u32 = 0x400; // 1KB reserved
-pub const BL_INFO_ADDR: u32 = 0x0800_0400;
-pub const BOOT_API_ADDR: u32 = 0x0800_0440;
-pub const SECRETS_ADDR: u32 = 0x0801_F000; // 2KB project keys & global secret
-pub const KEYTABLE_ADDR: u32 = 0x0801_F800; // 2KB public keys
+// Board-specific addresses and flash partitions live in `boot-layout` (per-board `Layout`),
+// not here: this crate only describes the ABI (structures, codes, capability bits).
 
-// Fixed addresses in RAM
-pub const AXI_SRAM_BASE: u32 = 0x2400_0000;
-pub const AXI_SRAM_SIZE: u32 = 512 * 1024;
-pub const APP_LOAD_ADDR: u32 = 0x2400_0000;
-pub const APP_VTOR_OFFSET: u32 = 0x400; // Header size is 1KB
-pub const APP_VTOR_ADDR: u32 = APP_LOAD_ADDR + APP_VTOR_OFFSET; // 0x24000400
+// Capability bits reported in `BootApi::caps` (what this bootloader/platform provides).
+/// Flash services need `IoOps` from the application (SPI transport lent to the bootloader).
+pub const CAP_IO_FROM_APP: u32 = 1 << 0;
+/// The bootloader owns the flash controller; the application needs to provide no transport.
+pub const CAP_BL_OWNS_FLASH: u32 = 1 << 1;
+/// Flash-modifying services mask interrupts while they run.
+pub const CAP_SERVICE_MASKS_IRQ: u32 = 1 << 2;
+/// Flash-modifying services execute from a reserved RAM region (see `BlInfo::ramfunc_*`).
+pub const CAP_SERVICE_RAM_RESIDENT: u32 = 1 << 3;
+/// The bootloader maps the selected slot to a fixed execution address (bank swap / remap).
+pub const CAP_REMAP_SLOT_MAPPING: u32 = 1 << 4;
+/// Images are stored encrypted on flash (device-bound storage encryption).
+pub const CAP_STORAGE_ENCRYPTION: u32 = 1 << 5;
 
-pub const SRAM4_BASE: u32 = 0x3800_0000;
-pub const SRAM4_SIZE: u32 = 64 * 1024;
-pub const SRAM4_BOOT_INFO_ADDR: u32 = 0x3800_0000;
-
-// NOR flash partition layout
-pub const NOR_JOURNAL_SECTOR_0: u32 = 0x0000_0000;
-pub const NOR_JOURNAL_SECTOR_1: u32 = 0x0000_1000;
-pub const NOR_RESERVED_OFFSET: u32 = 0x0000_2000;
-pub const NOR_SLOT_A_OFFSET: u32 = 0x0001_0000;
-pub const NOR_SLOT_B_OFFSET: u32 = 0x000B_0000;
-pub const NOR_SLOT_SIZE: u32 = 640 * 1024;
-pub const NOR_PAGE_SIZE: u32 = 256;
-pub const NOR_SECTOR_SIZE: u32 = 4096;
-pub const NOR_BLOCK_SIZE: u32 = 65536;
+// Execution models reported in `BlInfo::exec_model`.
+/// The verified image is copied into RAM and executed there.
+pub const EXEC_MODEL_RAM_LOAD: u32 = 0;
 
 // Error codes
 pub const BOOT_OK: i32 = 0;
@@ -131,7 +124,7 @@ pub struct SlotInfo {
     pub min_version: u32,
 }
 
-/// Bootloader information section (.bl_info) located at 0x08000400.
+/// Bootloader information section (`.bl_info`); its address comes from the board `Layout`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct BlInfo {
@@ -140,20 +133,30 @@ pub struct BlInfo {
     pub bl_size: u32,
     pub build_hash: [u8; 32],
     pub flags: u32,
-    pub reserved: [u32; 4],
+    /// Board id of the layout this bootloader was built for (same value as the image `BOARD_ID`).
+    pub platform_id: u32,
+    /// One of the `EXEC_MODEL_*` values.
+    pub exec_model: u32,
+    /// Reserved RAM region for RAM-resident flash routines (0/0 when unused).
+    pub ramfunc_base: u32,
+    pub ramfunc_size: u32,
 }
 
 /// Hardware bit-transfer operations provided by the Application.
 #[repr(C)]
 pub struct IoOps {
-    pub spi_transfer: unsafe extern "C" fn(tx: *const u8, rx: *mut u8, len: u32) -> i32,
-    pub cs: unsafe extern "C" fn(assert: bool),
+    /// SPI transport lent to the bootloader. `None` on platforms where the bootloader owns the
+    /// flash controller (see `CAP_BL_OWNS_FLASH`). `Option<fn>` has the same size as `fn`.
+    pub spi_transfer: Option<unsafe extern "C" fn(tx: *const u8, rx: *mut u8, len: u32) -> i32>,
+    /// Chip-select control matching `spi_transfer`.
+    pub cs: Option<unsafe extern "C" fn(assert: bool)>,
     pub millis: unsafe extern "C" fn() -> u32,
     pub yield_: unsafe extern "C" fn(),
     pub reserved: [usize; 4],
 }
 
-/// Bootloader resident service ABI function table (.boot_api) located at 0x08000440.
+/// Bootloader resident service ABI function table (`.boot_api`); its address comes from the
+/// board `Layout` (`boot_api_addr`).
 #[repr(C)]
 pub struct BootApi {
     pub magic: u32,
@@ -173,9 +176,17 @@ pub struct BootApi {
     pub update_feed: unsafe extern "C" fn(ctx: *mut u8, rx: *const u8, rx_len: u32, tx: *mut u8, tx_cap: u32) -> i32,
     pub update_abort: unsafe extern "C" fn(ctx: *mut u8) -> i32,
     pub system_reset: unsafe extern "C" fn() -> !,
-    pub reserved: [usize; 8],
+    /// `CAP_*` bits describing the platform (formerly reserved; 0 on a v1 table).
+    pub caps: u32,
+    pub reserved: [u32; 7],
 }
 
 // Ensure struct sizes match design specification:
 // BlInfo is exactly 64 bytes (0x40).
 const _: () = assert!(core::mem::size_of::<BlInfo>() == 64);
+
+// Pointer-sized fields make these layouts target-dependent; check them where they matter (32-bit).
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<IoOps>() == 32);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<BootApi>() == 96);

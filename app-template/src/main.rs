@@ -8,12 +8,13 @@
 
 use boot_abi::{IoOps, ERR_INVALID_STATE, SLOT_STATE_TESTING};
 use boot_api_client::BootApiClient;
+use boot_layout::H750_NETLITE;
 use cortex_m_rt::{entry, exception};
 use panic_halt as _;
 
 static APP_IO_OPS: IoOps = IoOps {
-    spi_transfer: app_spi_transfer,
-    cs: app_cs,
+    spi_transfer: Some(app_spi_transfer),
+    cs: Some(app_cs),
     millis: app_millis,
     yield_: app_yield,
     reserved: [0; 4],
@@ -55,8 +56,9 @@ fn main() -> ! {
     boot_stm32h7::uart_write_str("[APP] Hello from Application running in AXI SRAM!\r\n");
     boot_stm32h7::uart_write_str("[APP] VTOR: 0x24000400, Executing from RAM.\r\n");
 
-    // Connect to Bootloader ABI at 0x08000440
-    if let Some(client) = BootApiClient::new() {
+    // Connect to the Bootloader ABI table (address comes from the board layout).
+    // SAFETY: the H750 NetLite bootloader places its ABI table at this address.
+    if let Some(client) = unsafe { BootApiClient::at(H750_NETLITE.boot_api_addr) } {
         boot_stm32h7::uart_write_str("[APP] Connected to Bootloader ABI successfully.\r\n");
         if let Ok(info) = client.get_boot_info() {
             boot_stm32h7::uart_write_str("[APP] Boot Slot: ");

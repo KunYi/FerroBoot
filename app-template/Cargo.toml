@@ -17,4 +17,5 @@ panic-halt = { workspace = true }
 
 boot-abi = { workspace = true }
 boot-api-client = { workspace = true }
+boot-layout = { workspace = true }
 boot-stm32h7 = { workspace = true }

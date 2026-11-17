@@ -5,25 +5,37 @@
 
 #![no_std]
 
-use boot_abi::{
-    BootApi, BootInfo, IoOps, SlotInfo, BOOT_API_ADDR, BOOT_API_MAGIC, BOOT_OK,
-};
+use boot_abi::{BootApi, BootInfo, IoOps, SlotInfo, BOOT_ABI_VERSION, BOOT_API_MAGIC, BOOT_OK};
 
 pub struct BootApiClient {
     api: &'static BootApi,
 }
 
 impl BootApiClient {
-    /// Connects to the Bootloader ABI table at fixed address 0x08000440.
+    /// Connects to the Bootloader ABI table at `addr` (the board layout's `boot_api_addr`).
     ///
-    /// Returns `None` if the magic number is invalid or ABI table is unpopulated.
-    pub fn new() -> Option<Self> {
-        let api_ptr = BOOT_API_ADDR as *const BootApi;
-        let api = unsafe { &*api_ptr };
-        if api.magic != BOOT_API_MAGIC {
+    /// Returns `None` if the magic number is wrong, the table is unpopulated, or it speaks a
+    /// different ABI version than this client was built for.
+    ///
+    /// # Safety
+    /// `addr` must be the address of the bootloader's ABI table (or any readable memory that is
+    /// at least `size_of::<BootApi>()` bytes long): it is dereferenced to check the header.
+    pub unsafe fn at(addr: u32) -> Option<Self> {
+        let api = &*(addr as *const BootApi);
+        if api.magic != BOOT_API_MAGIC || api.abi_version != BOOT_ABI_VERSION {
             return None;
         }
         Some(Self { api })
+    }
+
+    /// ABI version reported by the bootloader.
+    pub fn abi_version(&self) -> u16 {
+        self.api.abi_version
+    }
+
+    /// Platform capability bits (`boot_abi::CAP_*`).
+    pub fn caps(&self) -> u32 {
+        self.api.caps
     }
 
     /// Reads BootInfo from Bootloader.

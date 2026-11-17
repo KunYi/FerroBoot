@@ -10,7 +10,7 @@ use boot_abi::*;
 use boot_core::{decide, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
 use boot_journal::JournalManager;
-use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE};
+use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
 use boot_nor::{NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
 use boot_stm32h7::{
     init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
@@ -32,7 +32,10 @@ pub static BOOTLOADER_INFO: BlInfo = BlInfo {
     bl_size: 96 * 1024,
     build_hash: [0x5A; 32],
     flags: 0,
-    reserved: [0; 4],
+    platform_id: H750_NETLITE_BOARD_ID,
+    exec_model: EXEC_MODEL_RAM_LOAD,
+    ramfunc_base: 0,
+    ramfunc_size: 0,
 };
 
 #[link_section = ".boot_api"]
@@ -55,7 +58,9 @@ pub static BOOT_API_TABLE: BootApi = BootApi {
     update_feed: abi_update_feed,
     update_abort: abi_update_abort,
     system_reset: abi_system_reset,
-    reserved: [0; 8],
+    // The application lends the SPI transport (IoOps) and images are stored encrypted on NOR.
+    caps: CAP_IO_FROM_APP | CAP_STORAGE_ENCRYPTION,
+    reserved: [0; 7],
 };
 
 #[link_section = ".secrets"]
@@ -129,8 +134,8 @@ pub static PUBLIC_KEY_TABLE: KeyTable = KeyTable {
 // ---------------------------------------------------------------------------
 
 static LOCAL_IO_OPS: IoOps = IoOps {
-    spi_transfer: local_spi_transfer,
-    cs: local_cs,
+    spi_transfer: Some(local_spi_transfer),
+    cs: Some(local_cs),
     millis: local_millis,
     yield_: local_yield,
     reserved: [0; 4],

@@ -8,6 +8,5 @@ description = "Per-board memory/flash layout as pure const data (no HAL dependen
 [dependencies]
 
 [dev-dependencies]
-# Migration guard only: proves the H750 numbers still equal the legacy boot-abi constants.
-# Removed together with those constants in the ABI v2 patch.
+# Used only to check that BootInfo fits in its reserved RAM head.
 boot-abi = { workspace = true }

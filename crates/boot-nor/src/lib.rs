@@ -55,6 +55,8 @@ pub const SEED_RECORD_MAGIC: u32 = 0x5345_4544; // 'SEED'
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NorError {
     IoError,
+    /// The `IoOps` provides no SPI transport (the platform's bootloader owns the flash).
+    NoTransport,
     Timeout,
     Protected,
     InvalidAddress,
@@ -141,8 +143,19 @@ impl<'a> SpiNorIoOpsDriver<'a> {
         Self { io }
     }
 
-    fn spi_xfer(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), NorError> {
-        let ret = unsafe { (self.io.spi_transfer)(tx.as_ptr(), rx.as_mut_ptr(), tx.len() as u32) };
+    /// Drives chip select if the platform provides one (no-op otherwise; the transfer itself then
+    /// fails cleanly with `NoTransport`).
+    fn cs_set(&self, assert: bool) {
+        if let Some(cs) = self.io.cs {
+            unsafe { cs(assert) };
+        }
+    }
+
+    fn spi_call(&self, tx: *const u8, rx: *mut u8, len: usize) -> Result<(), NorError> {
+        let Some(transfer) = self.io.spi_transfer else {
+            return Err(NorError::NoTransport);
+        };
+        let ret = unsafe { transfer(tx, rx, len as u32) };
         if ret == 0 {
             Ok(())
         } else {
@@ -150,11 +163,15 @@ impl<'a> SpiNorIoOpsDriver<'a> {
         }
     }
 
+    fn spi_xfer(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), NorError> {
+        self.spi_call(tx.as_ptr(), rx.as_mut_ptr(), tx.len())
+    }
+
     fn write_cmd(&self, cmd: &[u8]) -> Result<(), NorError> {
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let mut rx = [0u8; 8];
         let res = self.spi_xfer(cmd, &mut rx[..cmd.len()]);
-        unsafe { (self.io.cs)(false) };
+        self.cs_set(false);
         res
     }
 
@@ -183,17 +200,16 @@ impl<'a> NorFlash for SpiNorIoOpsDriver<'a> {
             addr as u8,
             0x00, // dummy byte
         ];
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let mut dummy = [0u8; 5];
         let res1 = self.spi_xfer(&cmd, &mut dummy);
         let res2 = if res1.is_ok() {
             // Read incoming data by clocking out zeros
-            let ret = unsafe { (self.io.spi_transfer)(core::ptr::null(), buf.as_mut_ptr(), buf.len() as u32) };
-            if ret == 0 { Ok(()) } else { Err(NorError::IoError) }
+            self.spi_call(core::ptr::null(), buf.as_mut_ptr(), buf.len())
         } else {
             res1
         };
-        unsafe { (self.io.cs)(false) };
+        self.cs_set(false);
         res2
     }
 
@@ -209,12 +225,15 @@ impl<'a> NorFlash for SpiNorIoOpsDriver<'a> {
                 (addr >> 8) as u8,
                 addr as u8,
             ];
-            unsafe { (self.io.cs)(true) };
+            self.cs_set(true);
             let mut dummy = [0u8; 4];
-            self.spi_xfer(&cmd, &mut dummy)?;
             let mut rx_dummy = [0u8; 256];
-            self.spi_xfer(&data[..chunk_len], &mut rx_dummy[..chunk_len])?;
-            unsafe { (self.io.cs)(false) };
+            let res = self.spi_xfer(&cmd, &mut dummy).and_then(|_| {
+                self.spi_xfer(&data[..chunk_len], &mut rx_dummy[..chunk_len])
+            });
+            // Always release chip select, also when a transfer failed.
+            self.cs_set(false);
+            res?;
 
             self.wait_ready(100)?;
             addr += chunk_len as u32;
@@ -248,29 +267,29 @@ impl<'a> NorFlash for SpiNorIoOpsDriver<'a> {
     }
 
     fn read_jedec_id(&mut self) -> Result<[u8; 3], NorError> {
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let cmd = [CMD_READ_JEDEC_ID, 0, 0, 0];
         let mut rx = [0u8; 4];
         let res = self.spi_xfer(&cmd, &mut rx);
-        unsafe { (self.io.cs)(false) };
+        self.cs_set(false);
         res.map(|_| [rx[1], rx[2], rx[3]])
     }
 
     fn read_status1(&mut self) -> Result<u8, NorError> {
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let cmd = [CMD_READ_STATUS_1, 0];
         let mut rx = [0u8; 2];
         let res = self.spi_xfer(&cmd, &mut rx);
-        unsafe { (self.io.cs)(false) };
+        self.cs_set(false);
         res.map(|_| rx[1])
     }
 
     fn read_status2(&mut self) -> Result<u8, NorError> {
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let cmd = [CMD_READ_STATUS_2, 0];
         let mut rx = [0u8; 2];
         let res = self.spi_xfer(&cmd, &mut rx);
-        unsafe { (self.io.cs)(false) };
+        self.cs_set(false);
         res.map(|_| rx[1])
     }
 
@@ -292,15 +311,16 @@ impl<'a> NorFlash for SpiNorIoOpsDriver<'a> {
 impl<'a> SecureRegion for SpiNorIoOpsDriver<'a> {
     fn read_unique_id(&mut self, buf: &mut [u8]) -> Result<usize, NorError> {
         // 4Bh + 4 dummy bytes + 8 or 16 UID bytes
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let cmd = [CMD_READ_UNIQUE_ID, 0, 0, 0, 0];
         let mut dummy = [0u8; 5];
-        self.spi_xfer(&cmd, &mut dummy)?;
         let read_len = buf.len().min(16);
         let zero = [0u8; 16];
-        let ret = unsafe { (self.io.spi_transfer)(zero.as_ptr(), buf.as_mut_ptr(), read_len as u32) };
-        unsafe { (self.io.cs)(false) };
-        if ret == 0 { Ok(read_len) } else { Err(NorError::IoError) }
+        let res = self
+            .spi_xfer(&cmd, &mut dummy)
+            .and_then(|_| self.spi_call(zero.as_ptr(), buf.as_mut_ptr(), read_len));
+        self.cs_set(false);
+        res.map(|_| read_len)
     }
 
     fn read_security_register(&mut self, reg_num: u8, offset: u16, buf: &mut [u8]) -> Result<(), NorError> {
@@ -312,15 +332,20 @@ impl<'a> SecureRegion for SpiNorIoOpsDriver<'a> {
             addr as u8,
             0x00, // 1 dummy byte
         ];
-        unsafe { (self.io.cs)(true) };
+        self.cs_set(true);
         let mut dummy = [0u8; 5];
-        self.spi_xfer(&cmd, &mut dummy)?;
-        let ret = unsafe { (self.io.spi_transfer)(core::ptr::null(), buf.as_mut_ptr(), buf.len() as u32) };
-        unsafe { (self.io.cs)(false) };
-        if ret == 0 { Ok(()) } else { Err(NorError::IoError) }
+        let res = self
+            .spi_xfer(&cmd, &mut dummy)
+            .and_then(|_| self.spi_call(core::ptr::null(), buf.as_mut_ptr(), buf.len()));
+        self.cs_set(false);
+        res
     }
 
     fn program_security_register(&mut self, reg_num: u8, offset: u16, data: &[u8]) -> Result<(), NorError> {
+        // A security register page is at most 256 bytes; reject before touching the bus.
+        if data.len() > 256 {
+            return Err(NorError::InvalidAddress);
+        }
         self.write_enable()?;
         let addr = ((reg_num as u32) << 12) | (offset as u32 & 0x0FFF);
         let cmd = [
@@ -329,12 +354,14 @@ impl<'a> SecureRegion for SpiNorIoOpsDriver<'a> {
             (addr >> 8) as u8,
             addr as u8,
         ];
-        unsafe { (self.io.cs)(true) };
-        let mut dummy = [0u8; 4];
-        self.spi_xfer(&cmd, &mut dummy)?;
         let mut rx_dummy = [0u8; 256];
-        self.spi_xfer(data, &mut rx_dummy[..data.len()])?;
-        unsafe { (self.io.cs)(false) };
+        self.cs_set(true);
+        let mut dummy = [0u8; 4];
+        let res = self
+            .spi_xfer(&cmd, &mut dummy)
+            .and_then(|_| self.spi_xfer(data, &mut rx_dummy[..data.len()]));
+        self.cs_set(false);
+        res?;
         self.wait_ready(100)
     }
 
@@ -574,10 +601,11 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_spi(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
-        let tx = core::slice::from_raw_parts(tx, len as usize);
+        // The driver passes tx = null when it only wants to clock data in.
+        let first_tx_byte = if tx.is_null() { 0 } else { *tx };
         let rx = core::slice::from_raw_parts_mut(rx, len as usize);
         rx.fill(0);
-        if tx[0] == CMD_READ_STATUS_1 && len >= 2 {
+        if first_tx_byte == CMD_READ_STATUS_1 && len >= 2 {
             FAKE.with(|f| {
                 let mut f = f.borrow_mut();
                 if f.busy_polls > 0 {
@@ -605,8 +633,8 @@ mod tests {
     }
 
     static FAKE_IO: IoOps = IoOps {
-        spi_transfer: fake_spi,
-        cs: fake_cs,
+        spi_transfer: Some(fake_spi),
+        cs: Some(fake_cs),
         millis: fake_millis,
         yield_: fake_yield,
         reserved: [0; 4],
@@ -688,5 +716,115 @@ mod tests {
                 assert!(!rec.is_valid(), "byte {byte} bit {bit} went unnoticed");
             }
         }
+    }
+
+    // --- Optional transport and chip-select hygiene ---------------------------------------------
+
+    thread_local! {
+        static CS_LOG: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) }; // (asserts, releases)
+        /// Number of SPI transfers that still succeed; the next one fails (`None` = never fail).
+        static SPI_BUDGET: RefCell<Option<u32>> = const { RefCell::new(None) };
+    }
+
+    unsafe extern "C" fn counting_cs(assert: bool) {
+        CS_LOG.with(|c| {
+            let mut c = c.borrow_mut();
+            if assert {
+                c.0 += 1
+            } else {
+                c.1 += 1
+            }
+        });
+    }
+
+    unsafe extern "C" fn maybe_failing_spi(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
+        let allowed = SPI_BUDGET.with(|b| {
+            let mut b = b.borrow_mut();
+            match *b {
+                None => true,
+                Some(0) => false,
+                Some(n) => {
+                    *b = Some(n - 1);
+                    true
+                }
+            }
+        });
+        if !allowed {
+            return -1;
+        }
+        fake_spi(tx, rx, len)
+    }
+
+    static COUNTING_IO: IoOps = IoOps {
+        spi_transfer: Some(maybe_failing_spi),
+        cs: Some(counting_cs),
+        millis: fake_millis,
+        yield_: fake_yield,
+        reserved: [0; 4],
+    };
+
+    static NO_TRANSPORT_IO: IoOps = IoOps {
+        spi_transfer: None,
+        cs: None,
+        millis: fake_millis,
+        yield_: fake_yield,
+        reserved: [0; 4],
+    };
+
+    fn reset_counters(spi_budget: Option<u32>) {
+        setup(1_000, 1, 0);
+        CS_LOG.with(|c| *c.borrow_mut() = (0, 0));
+        SPI_BUDGET.with(|b| *b.borrow_mut() = spi_budget);
+    }
+
+    #[test]
+    fn without_a_transport_every_operation_fails_cleanly() {
+        setup(1_000, 1, 0);
+        let mut nor = SpiNorIoOpsDriver::new(&NO_TRANSPORT_IO);
+        let mut buf = [0u8; 4];
+        assert_eq!(nor.read_jedec_id(), Err(NorError::NoTransport));
+        assert_eq!(nor.read(0, &mut buf), Err(NorError::NoTransport));
+        assert_eq!(nor.write(0, &[1, 2, 3]), Err(NorError::NoTransport));
+        assert_eq!(nor.erase_sector_4k(0), Err(NorError::NoTransport));
+        assert_eq!(nor.read_security_register(1, 0, &mut buf), Err(NorError::NoTransport));
+        assert_eq!(nor.read_unique_id(&mut buf), Err(NorError::NoTransport));
+    }
+
+    #[test]
+    fn chip_select_is_released_at_every_failure_point() {
+        type Op = fn(&mut SpiNorIoOpsDriver, &mut [u8]) -> Result<(), NorError>;
+        let ops: [(&str, Op); 7] = [
+            ("read", |n, b| n.read(0, b)),
+            ("write", |n, _| n.write(0, &[1, 2, 3, 4])),
+            ("erase_sector_4k", |n, _| n.erase_sector_4k(0)),
+            ("read_jedec_id", |n, _| n.read_jedec_id().map(|_| ())),
+            ("read_security_register", |n, b| n.read_security_register(1, 0, b)),
+            ("program_security_register", |n, _| n.program_security_register(1, 0, &[1, 2])),
+            ("read_unique_id", |n, b| n.read_unique_id(b).map(|_| ())),
+        ];
+        let mut buf = [0u8; 8];
+        for (name, op) in ops {
+            // Let exactly `budget` transfers succeed, then fail: this walks the failure through
+            // every early-return point of the operation.
+            for budget in 0..=6u32 {
+                reset_counters(Some(budget));
+                let mut nor = SpiNorIoOpsDriver::new(&COUNTING_IO);
+                let _ = op(&mut nor, &mut buf);
+                let (asserts, releases) = CS_LOG.with(|c| *c.borrow());
+                assert_eq!(
+                    asserts, releases,
+                    "{name}: chip select left asserted when transfer #{budget} failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn program_security_register_rejects_oversized_data_without_touching_the_bus() {
+        reset_counters(None);
+        let mut nor = SpiNorIoOpsDriver::new(&COUNTING_IO);
+        let big = [0u8; 257];
+        assert_eq!(nor.program_security_register(1, 0, &big), Err(NorError::InvalidAddress));
+        assert_eq!(CS_LOG.with(|c| c.borrow().0), 0);
     }
 }

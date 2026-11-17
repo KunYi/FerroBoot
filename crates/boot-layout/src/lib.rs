@@ -82,6 +82,15 @@ pub struct Layout {
     pub exec: ExecModel,
     /// RAM address where `BootInfo` is handed to the application.
     pub boot_info_addr: u32,
+    /// Fixed bootloader tables in the bootloader's own (memory-mapped) flash. These addresses
+    /// must match the bootloader linker script; a host test checks that for every board.
+    pub bl_info_addr: u32,
+    /// Bootloader resident service table (`BootApi`); applications look it up here.
+    pub boot_api_addr: u32,
+    /// Project keys and global secret (`SecretsTable`).
+    pub secrets_addr: u32,
+    /// Public key table (`KeyTable`).
+    pub keytable_addr: u32,
 }
 
 impl Layout {
@@ -125,12 +134,15 @@ impl Layout {
     }
 }
 
+/// `BOARD_ID` of the H750 NetLite (ASCII 'H750'); a plain const so statics can use it.
+pub const H750_NETLITE_BOARD_ID: u32 = 0x4837_3530;
+
 /// H750 NetLite: STM32H750 + 4 MB external SPI NOR, application loaded into AXI SRAM.
 ///
 /// Numbers are the historical values of the former `boot-abi` constants (plan §4.1–§4.3).
 pub static H750_NETLITE: Layout = Layout {
     name: "h750-netlite",
-    board_id: 0x4837_3530, // ASCII 'H750'
+    board_id: H750_NETLITE_BOARD_ID,
     journal: [Region::new(0x0000_0000, 4096), Region::new(0x0000_1000, 4096)],
     slots: [
         Region::new(0x0001_0000, 640 * 1024),
@@ -141,6 +153,10 @@ pub static H750_NETLITE: Layout = Layout {
         vtor_offset: 0x400,
     },
     boot_info_addr: 0x3800_0000,
+    bl_info_addr: 0x0800_0400,
+    boot_api_addr: 0x0800_0440,
+    secrets_addr: 0x0801_F000,
+    keytable_addr: 0x0801_F800,
 };
 
 /// Every known board, for tools that select one by name.
@@ -213,26 +229,67 @@ mod tests {
         assert_eq!(by_name("nope"), None);
     }
 
-    /// Migration guard: the new layout must equal the legacy constants it replaces.
+    // --- Drift guards: the linker scripts and the Layout must agree ---------------------------
+
+    const BOOTLOADER_MEMORY_X: &str = include_str!("../../../bootloader-h750/memory.x");
+    const APP_MEMORY_X: &str = include_str!("../../../app-template/memory.x");
+
+    fn parse_hex(s: &str) -> u32 {
+        u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap()
+    }
+
+    /// Address given to an output section: `.name 0xADDR :`.
+    fn section_addr(script: &str, name: &str) -> u32 {
+        let line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with(name) && l.contains("0x"))
+            .unwrap_or_else(|| panic!("section {name} not found in linker script"));
+        let tok = line.split_whitespace().nth(1).unwrap();
+        parse_hex(tok)
+    }
+
+    /// `ORIGIN = 0x...` of a MEMORY region line starting with `name`.
+    fn region_origin(script: &str, name: &str) -> u32 {
+        let line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("region {name} not found"));
+        let after = line.split("ORIGIN").nth(1).unwrap();
+        let tok = after.split('=').nth(1).unwrap().split(',').next().unwrap();
+        parse_hex(tok.trim())
+    }
+
     #[test]
-    fn h750_netlite_matches_legacy_boot_abi_constants() {
-        use boot_abi::*;
+    fn h750_fixed_tables_match_the_bootloader_linker_script() {
         let l = &H750_NETLITE;
-        assert_eq!(l.journal[0].offset, NOR_JOURNAL_SECTOR_0);
-        assert_eq!(l.journal[1].offset, NOR_JOURNAL_SECTOR_1);
-        assert_eq!(l.journal[0].len, NOR_SECTOR_SIZE);
-        assert_eq!(l.slots[0].offset, NOR_SLOT_A_OFFSET);
-        assert_eq!(l.slots[1].offset, NOR_SLOT_B_OFFSET);
-        assert_eq!(l.slots[0].len, NOR_SLOT_SIZE);
-        assert_eq!(l.slots[1].len, NOR_SLOT_SIZE);
-        assert_eq!(l.load_addr(), Some(AXI_SRAM_BASE));
-        assert_eq!(l.entry_vtor_addr(), APP_VTOR_ADDR);
-        assert_eq!(l.boot_info_addr, SRAM4_BOOT_INFO_ADDR);
-        match l.exec {
-            ExecModel::RamLoad { load, vtor_offset } => {
-                assert_eq!(load.len, AXI_SRAM_SIZE);
-                assert_eq!(vtor_offset, APP_VTOR_OFFSET);
-            }
+        assert_eq!(section_addr(BOOTLOADER_MEMORY_X, ".bl_info"), l.bl_info_addr);
+        assert_eq!(section_addr(BOOTLOADER_MEMORY_X, ".boot_api"), l.boot_api_addr);
+        assert_eq!(section_addr(BOOTLOADER_MEMORY_X, ".secrets"), l.secrets_addr);
+        assert_eq!(section_addr(BOOTLOADER_MEMORY_X, ".keytable"), l.keytable_addr);
+    }
+
+    #[test]
+    fn h750_bootinfo_sits_in_the_reserved_head_of_the_bootloader_ram() {
+        let l = &H750_NETLITE;
+        let ram = region_origin(BOOTLOADER_MEMORY_X, "RAM");
+        // BootInfo lives in the first 0x100 bytes of SRAM4; the bootloader's own RAM starts after.
+        assert_eq!(ram, l.boot_info_addr + 0x100);
+        assert!(core::mem::size_of::<boot_abi::BootInfo>() <= 0x100);
+    }
+
+    #[test]
+    fn h750_app_is_linked_where_the_layout_says_it_runs() {
+        let l = &H750_NETLITE;
+        // The application's code starts at the vector table, right after the 1 KiB header.
+        assert_eq!(region_origin(APP_MEMORY_X, "FLASH"), l.entry_vtor_addr());
+    }
+
+    #[test]
+    fn fixed_tables_are_ordered_and_fit_the_bootloader_flash() {
+        for l in ALL {
+            assert!(l.bl_info_addr < l.boot_api_addr);
+            assert!(l.boot_api_addr + 0x100 <= l.secrets_addr);
+            assert!(l.secrets_addr < l.keytable_addr);
         }
     }
 }

@@ -1,6 +1,6 @@
 # FerroBoot Application Boot API Guide
 
-*ABI version 1 · Target: STM32H750VB · Written from a source review of the FerroBoot repository. The examples have not been compiled or run on hardware.*
+*ABI version 2 · Target: STM32H750VB · Written from a source review of the FerroBoot repository. The examples have not been compiled or run on hardware.*
 
 ## 1. Overview
 
@@ -22,7 +22,7 @@ The Rust wrapper `boot-api-client` (`BootApiClient`) is a thin safe layer over t
 | --- | --- | --- |
 | Bootloader flash | `0x0800_0000` | 128 KB, single sector |
 | `BlInfo` | `0x0800_0400` | 64 bytes, magic `.BLI` |
-| **Boot API table** | **`0x0800_0440`** | magic `BAPI` (`0x4950_4142`) |
+| **Boot API table** | **`0x0800_0440`** | magic `BAPI` (`0x4950_4142`); this is the H750 NetLite value, the address comes from the board `Layout::boot_api_addr` |
 | App load address (AXI SRAM) | `0x2400_0000` | 1 KB image header, then the app |
 | **App vector table (VTOR)** | **`0x2400_0400`** | `FLASH` region in the app's `memory.x` |
 | `BootInfo` | `0x3800_0000` (SRAM4) | needs the SRAM4 clock enabled to read directly |
@@ -40,21 +40,17 @@ The bootloader leaves the CPU with **interrupts disabled (PRIMASK set)** before 
 ## 3. Connecting to the Boot API
 
 ```rust
-use boot_abi::{BOOT_ABI_VERSION, BOOT_API_ADDR, BootApi};
 use boot_api_client::BootApiClient;
+use boot_layout::H750_NETLITE;
 
-let client = match BootApiClient::new() {
+// SAFETY: the H750 NetLite bootloader places its ABI table at `boot_api_addr`.
+let client = match unsafe { BootApiClient::at(H750_NETLITE.boot_api_addr) } {
     Some(c) => c,
-    None => { /* magic mismatch: no bootloader table at 0x0800_0440 */ loop {} }
+    None => { /* wrong magic or a different ABI version: no compatible bootloader table here */ loop {} }
 };
 ```
 
-`BootApiClient::new()` checks only the magic number. For forward compatibility, also check the ABI version yourself before relying on newer behavior:
-
-```rust
-let api = unsafe { &*(BOOT_API_ADDR as *const BootApi) };
-assert!(api.abi_version == BOOT_ABI_VERSION);
-```
+`BootApiClient::at()` checks the magic number **and** that the table's `abi_version` equals the version this client was built for (`BOOT_ABI_VERSION`, currently 2). `client.abi_version()` and `client.caps()` report what the bootloader provides (see 4.4).
 
 `table_len` and the trailing `reserved` entries are provided so that future ABI versions can append functions without breaking existing applications.
 
@@ -94,8 +90,8 @@ Hardware callbacks that the **application** provides to the bootloader code:
 ```rust
 #[repr(C)]
 pub struct IoOps {
-    pub spi_transfer: unsafe extern "C" fn(tx: *const u8, rx: *mut u8, len: u32) -> i32,
-    pub cs:           unsafe extern "C" fn(assert: bool),
+    pub spi_transfer: Option<unsafe extern "C" fn(tx: *const u8, rx: *mut u8, len: u32) -> i32>,
+    pub cs:           Option<unsafe extern "C" fn(assert: bool)>,
     pub millis:       unsafe extern "C" fn() -> u32,
     pub yield_:       unsafe extern "C" fn(),
     pub reserved:     [usize; 4],
@@ -103,6 +99,23 @@ pub struct IoOps {
 ```
 
 The `IoOps` instance must stay valid for the duration of the call. Declare it `static` and pass a reference.
+
+`spi_transfer` and `cs` are `Option`s (`NULL` in C). `Option<fn>` has the same size as a function pointer, so the structure layout did not change. On H750 NetLite the application **must** provide both (`CAP_IO_FROM_APP`); a call that needs the SPI transport while it is `None` fails with `ERR_NOR_IO`. Platforms whose bootloader owns the flash controller (`CAP_BL_OWNS_FLASH`) ignore them and the application may pass `None`.
+
+### 4.4 `caps` and the `BlInfo` platform fields (ABI v2)
+
+`BootApi::caps` (formerly reserved, `0` on a v1 table) tells the application what the platform provides:
+
+| Bit | Constant | Meaning |
+| --- | --- | --- |
+| 0 | `CAP_IO_FROM_APP` | flash services need `IoOps` with an SPI transport from the application (H750 NetLite) |
+| 1 | `CAP_BL_OWNS_FLASH` | the bootloader owns the flash controller; no transport needed |
+| 2 | `CAP_SERVICE_MASKS_IRQ` | flash-modifying services mask interrupts while they run |
+| 3 | `CAP_SERVICE_RAM_RESIDENT` | flash-modifying services run from a reserved RAM region |
+| 4 | `CAP_REMAP_SLOT_MAPPING` | the bootloader maps the selected slot to a fixed execution address |
+| 5 | `CAP_STORAGE_ENCRYPTION` | images are stored encrypted on flash |
+
+H750 NetLite reports `CAP_IO_FROM_APP | CAP_STORAGE_ENCRYPTION`. The `BlInfo` structure (64 bytes, same size as before) replaced its four reserved words with `platform_id` (the board id, same value as the image `BOARD_ID`), `exec_model` (`EXEC_MODEL_RAM_LOAD` = 0), and `ramfunc_base` / `ramfunc_size` (a reserved RAM region for RAM-resident flash code; `0/0` on H750).
 
 ## 5. Implementing `IoOps`
 
@@ -216,8 +229,8 @@ Decide whether to confirm from the **slot state**, not from `trial_count` alone 
 use boot_abi::*;
 
 static APP_IO_OPS: IoOps = IoOps {
-    spi_transfer: app_spi_transfer,
-    cs: app_cs,
+    spi_transfer: Some(app_spi_transfer),
+    cs: Some(app_cs),
     millis: app_millis,
     yield_: app_yield,
     reserved: [0; 4],
@@ -348,7 +361,7 @@ These come from reading the sources and should be treated as open issues, not as
 - [ ] `init_clocks()` runs first, and `IoOps` callbacks are implemented, including a working `millis`
 - [ ] Interrupts enabled if SysTick or other interrupts are used
 - [ ] Watchdog kicked from the first instruction and from `yield_`
-- [ ] `BootApiClient::new()` succeeds and `abi_version == 1`
+- [ ] `BootApiClient::at(boot_api_addr)` succeeds (it checks `abi_version == 2` for you)
 - [ ] Confirmation is decided from `slot_status(boot_slot).state == SLOT_STATE_TESTING`
 - [ ] Updates stage into `1 - boot_slot`, call `verify_slot` before `mark_pending`, and use a work buffer that does not overlap the running image
 - [ ] A test that deliberately does not confirm, to check rollback on your board
@@ -372,9 +385,17 @@ extern "C" {
 /* ---- Magic numbers, version, fixed addresses ---- */
 #define BOOT_API_MAGIC     0x49504142u   /* 'BAPI' */
 #define BOOT_INFO_MAGIC    0x4F464E49u   /* 'INFO' */
-#define BOOT_ABI_VERSION   1u
+#define BOOT_ABI_VERSION   2u
 
-#define BOOT_API_ADDR      0x08000440u   /* function table in bootloader flash */
+#define BOOT_API_ADDR      0x08000440u   /* function table in bootloader flash (H750 NetLite) */
+
+/* Capability bits reported in boot_api_t.caps */
+#define CAP_IO_FROM_APP          (1u << 0)
+#define CAP_BL_OWNS_FLASH        (1u << 1)
+#define CAP_SERVICE_MASKS_IRQ    (1u << 2)
+#define CAP_SERVICE_RAM_RESIDENT (1u << 3)
+#define CAP_REMAP_SLOT_MAPPING   (1u << 4)
+#define CAP_STORAGE_ENCRYPTION   (1u << 5)
 #define BOOT_INFO_ADDR     0x38000000u   /* SRAM4 (clock must be enabled) */
 #define APP_VTOR_ADDR      0x24000400u   /* app vector table in AXI SRAM */
 #define BOOT_SLOT_SIZE     (640u * 1024u)
@@ -445,7 +466,9 @@ typedef struct {
 } boot_slot_info_t;
 
 /* Hardware callbacks provided BY THE APPLICATION to the bootloader code.
- * tx may be NULL (read: send dummy bytes). cs(true) drives CS low. */
+ * tx may be NULL (read: send dummy bytes). cs(true) drives CS low.
+ * spi_transfer and cs are required on H750 NetLite (CAP_IO_FROM_APP); NULL only where the
+ * bootloader owns the flash controller (CAP_BL_OWNS_FLASH). */
 typedef struct {
     int32_t  (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t len);
     void     (*cs)(bool select);
@@ -477,7 +500,8 @@ typedef struct {
                            uint8_t *tx, uint32_t tx_cap);
     int32_t (*update_abort)(uint8_t *ctx);
     void    (*system_reset)(void);  /* never returns; see note below */
-    uintptr_t reserved[8];
+    uint32_t caps;             /* CAP_* bits (0 on an ABI v1 table) */
+    uint32_t reserved[7];
 } boot_api_t;
 
 #ifndef __cplusplus
