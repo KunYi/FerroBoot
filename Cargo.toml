@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+# No shared version: every crate declares its own (see docs/compat.md).
 edition = "2021"
 authors = ["STM32H750 Bootloader Team"]
 license = "MIT OR Apache-2.0"

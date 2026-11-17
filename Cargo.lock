@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "app-template"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-api-client",
@@ -140,21 +140,21 @@ dependencies = [
 
 [[package]]
 name = "boot-abi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "boot-api-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
 ]
 
 [[package]]
 name = "boot-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-crypto",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "boot-image"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-layout",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "boot-journal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-crc",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "boot-nor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-crc",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "boot-stm32h7"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-nor",
@@ -245,7 +245,7 @@ version = "0.1.0"
 
 [[package]]
 name = "boot-update"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-core",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "bootloader-h750"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-core",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-crypto",
