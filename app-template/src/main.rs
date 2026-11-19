@@ -69,10 +69,26 @@ fn main() -> ! {
 
             // Confirm only while this slot is on trial (state Testing). Decide from the slot
             // state, not from trial_count: a confirmed image must not try to confirm again.
-            let testing = matches!(
-                client.slot_status(info.boot_slot),
-                Ok(s) if s.state == SLOT_STATE_TESTING
-            );
+            // Report what slot_status() actually returned: a failed call must not be
+            // mistaken for "already confirmed".
+            let testing = match client.slot_status(info.boot_slot) {
+                Ok(s) => {
+                    boot_stm32h7::uart_write_str("[APP] slot_status: state=");
+                    boot_stm32h7::uart_write_hex(s.state);
+                    boot_stm32h7::uart_write_str(", trial=");
+                    boot_stm32h7::uart_write_hex(s.trial_count);
+                    boot_stm32h7::uart_write_str("\r\n");
+                    s.state == SLOT_STATE_TESTING
+                }
+                Err(e) => {
+                    boot_stm32h7::uart_write_str("[APP] slot_status FAILED, err=0x");
+                    for b in e.to_be_bytes() {
+                        boot_stm32h7::uart_write_hex(b);
+                    }
+                    boot_stm32h7::uart_write_str("\r\n");
+                    false
+                }
+            };
             if testing {
                 boot_stm32h7::uart_write_str("[APP] Confirming firmware update via ABI...\r\n");
                 match client.confirm(&APP_IO_OPS) {
@@ -82,10 +98,16 @@ fn main() -> ! {
                     Err(ERR_INVALID_STATE) => {
                         boot_stm32h7::uart_write_str("[APP] Firmware already confirmed.\r\n")
                     }
-                    Err(_) => boot_stm32h7::uart_write_str("[APP] Firmware confirm failed!\r\n"),
+                    Err(e) => {
+                        boot_stm32h7::uart_write_str("[APP] Firmware confirm FAILED, err=0x");
+                        for b in e.to_be_bytes() {
+                            boot_stm32h7::uart_write_hex(b);
+                        }
+                        boot_stm32h7::uart_write_str("\r\n");
+                    }
                 }
             } else {
-                boot_stm32h7::uart_write_str("[APP] Firmware already confirmed, normal boot.\r\n");
+                boot_stm32h7::uart_write_str("[APP] Not on trial (no confirm needed).\r\n");
             }
         }
     } else {

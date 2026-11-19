@@ -44,6 +44,25 @@ pub fn init_sram4_ecc() {
     }
 }
 
+/// PLL1 plan (HSE 25 MHz): /5 -> 5 MHz, x160 -> 800 MHz VCO.
+pub const PLL1_VCO_HZ: u32 = 25_000_000 / 5 * 160;
+/// PLL1_P = SYSCLK.
+pub const PLL1_P_DIV: u32 = 2;
+/// PLL1_Q = SPI1/2/3 kernel clock (RCC_D2CCIP1R.SPI123SEL = PLL1_Q).
+/// Left at its reset value (/2 = 400 MHz) before E.1; the board-verified NetLite C
+/// bootloader runs 160 MHz here (PLLQ = 5) and 80 MHz SCK.
+pub const PLL1_Q_DIV: u32 = 5;
+pub const SPI123_KER_HZ: u32 = PLL1_VCO_HZ / PLL1_Q_DIV;
+/// RM0433: SPI1/2/3 kernel clock must not exceed 200 MHz.
+pub const SPI123_KER_MAX_HZ: u32 = 200_000_000;
+/// `CFG1.MBR` for SPI1: SCK = kernel / 2^(MBR+1). 0 = /2, i.e. 80 MHz at the 160 MHz
+/// kernel clock (the rate the board-verified C bootloader runs).
+pub const SPI1_MBR_BITS: u8 = 0;
+pub const SPI1_SCK_HZ: u32 = SPI123_KER_HZ / (2u32 << SPI1_MBR_BITS);
+
+// Fails the build if someone changes the PLL plan so SPI1 would be overclocked again.
+const _: () = assert!(SPI123_KER_HZ <= SPI123_KER_MAX_HZ);
+
 /// Initializes MCU system clocks to 400MHz (VOS1) using 25MHz HSE crystal.
 pub fn init_clocks() {
     // 1. Configure power supply (LDO) and Voltage Output Scale 1 (VOS1)
@@ -100,11 +119,14 @@ pub fn init_clocks() {
 
     pac::RCC.plldivr(0).modify(|w| {
         w.set_plln(pac::rcc::vals::Plln::from_bits(160 - 1));
-        w.set_pllp(pac::rcc::vals::Plldiv::DIV2);
+        w.set_pllp(pac::rcc::vals::Plldiv::from_bits((PLL1_P_DIV - 1) as u8));
+        // PLL1_Q feeds SPI1/2/3; do not rely on the reset value (/2 = 400 MHz, out of spec).
+        w.set_pllq(pac::rcc::vals::Plldiv::from_bits((PLL1_Q_DIV - 1) as u8));
     });
 
     pac::RCC.pllcfgr().modify(|w| {
         w.set_divpen(0, true);
+        w.set_divqen(0, true);
         w.set_pllrge(0, pac::rcc::vals::Pllrge::RANGE4);
         w.set_pllvcosel(0, pac::rcc::vals::Pllvcosel::WIDE_VCO);
     });
@@ -116,6 +138,11 @@ pub fn init_clocks() {
     while !pac::RCC.cr().read().pllrdy(0) {
         // Wait for PLL1 ready
     }
+
+    // SPI1/2/3 kernel clock = PLL1_Q (this is also the reset default; made explicit).
+    pac::RCC.d2ccip1r().modify(|w| {
+        w.set_spi123sel(pac::rcc::vals::Saisel::PLL1_Q);
+    });
 
     // 5. Switch System Clock to PLL1
     pac::RCC.cfgr().modify(|w| {
@@ -141,7 +168,7 @@ pub fn init_nor_cs() {
         w.set_moder(PIN_NOR_CS_PIN as usize, pac::gpio::vals::Moder::OUTPUT);
     });
     gpioa.ospeedr().modify(|w| {
-        w.set_ospeedr(PIN_NOR_CS_PIN as usize, pac::gpio::vals::Ospeedr::VERY_HIGH_SPEED);
+        w.set_ospeedr(PIN_NOR_CS_PIN as usize, pac::gpio::vals::Ospeedr::HIGH_SPEED);
     });
     gpioa.bsrr().write(|w| {
         w.set_bs(PIN_NOR_CS_PIN as usize, true);
@@ -354,6 +381,15 @@ pub fn init_spi1() {
     let gpioa = pac::GPIOA;
     let gpiob = pac::GPIOB;
 
+    // Reset SPI1 first, then run the original initialisation. This is the order the 0014
+    // matrix measured as 8/8 ("reset+init"): the reset happens BEFORE the GPIO alternate
+    // function setup. (0016 put it after the GPIO setup, which that data does not cover.)
+    // The clock must be on for the reset to take effect on a cold start.
+    pac::RCC.apb2enr().modify(|w| {
+        w.set_spi1en(true);
+    });
+    spi1_reset_pulse();
+
     // Configure PA5 (SCK), PA6 (MISO) as AF5 (in AFRL, index 0)
     gpioa.moder().modify(|w| {
         w.set_moder(5, pac::gpio::vals::Moder::ALTERNATE);
@@ -372,10 +408,15 @@ pub fn init_spi1() {
         w.set_afr(5, 5); // AF5
     });
 
-    // Enable SPI1 clock
-    pac::RCC.apb2enr().modify(|w| {
-        w.set_spi1en(true);
+    // High output speed for the pins the SPI drives (SCK, MOSI) to meet 80 MHz timing.
+    // MISO is an input: OSPEEDR only affects the output driver, so it is left alone.
+    gpioa.ospeedr().modify(|w| {
+        w.set_ospeedr(PIN_NOR_SCK_PIN as usize, pac::gpio::vals::Ospeedr::HIGH_SPEED);
     });
+    gpiob.ospeedr().modify(|w| {
+        w.set_ospeedr(PIN_NOR_MOSI_PIN as usize, pac::gpio::vals::Ospeedr::HIGH_SPEED);
+    });
+
 
     // Configure SPI1 in Master Mode, Mode 0 (CPOL=0, CPHA=0)
     let spi = pac::SPI1;
@@ -389,7 +430,7 @@ pub fn init_spi1() {
     });
 
     spi.cfg1().modify(|w| {
-        w.set_mbr(pac::spi::vals::Mbr::DIV16);
+        w.set_mbr(pac::spi::vals::Mbr::from_bits(SPI1_MBR_BITS));
         w.set_dsize(7); // 8-bit data frame
     });
 
@@ -577,6 +618,22 @@ pub fn uart_write_hex(b: u8) {
     uart_write_byte(HEX[(b & 0x0F) as usize]);
 }
 
+/// Pulses the SPI1 reset bit in RCC, returning the whole peripheral to its reset state.
+///
+/// Used at the start of `init_spi1()` and before jumping to the application. Clearing SPE
+/// is not enough: on the H750 NetLite, once SPI1 had been used, re-running the original
+/// `init_spi1()` (which only toggles SPE) left the command+data read pattern of
+/// `NorFlash::read` failing 7 of 8 times, while an RCC reset first made it 8/8. Neither
+/// an extra SPE toggle nor a delay helped. The leftover state that survives SPE=0 is not
+/// identified.
+pub fn spi1_reset_pulse() {
+    pac::RCC.apb2rstr().modify(|w| w.set_spi1rst(true));
+    pac::RCC.apb2rstr().modify(|w| w.set_spi1rst(false));
+    // Make sure the reset release has reached the peripheral before it is configured.
+    let _ = pac::RCC.apb2rstr().read();
+    cortex_m::asm::dsb();
+}
+
 pub fn uart_read_byte() -> Option<u8> {
     let usart = pac::USART1;
     if usart.isr().read().rxne() {
@@ -616,7 +673,8 @@ pub unsafe fn jump_to_app(vtor_addr: u32) -> ! {
     (*syst).cvr.write(0);
 
     // 3. Deinit SPI, GPIO, UART
-    pac::SPI1.cr1().modify(|w| w.set_spe(false));
+    // Reset (not just disable) SPI1 so the application inherits a clean peripheral.
+    spi1_reset_pulse();
     pac::USART1.cr1().modify(|w| w.set_ue(false));
 
     // 4. Restore RCC to HSI (64MHz), wait HSI ready, keep SRAM4 clock enabled
@@ -665,4 +723,19 @@ pub unsafe fn jump_to_app(vtor_addr: u32) -> ! {
 #[cfg(not(target_arch = "arm"))]
 pub unsafe fn jump_to_app(_vtor_addr: u32) -> ! {
     unimplemented!("jump_to_app is only supported on ARM target architecture");
+}
+
+#[cfg(test)]
+mod clock_plan_tests {
+    #[test]
+    fn clock_plan_matches_the_board_verified_values() {
+        use super::*;
+        assert_eq!(PLL1_VCO_HZ, 800_000_000);
+        assert_eq!(PLL1_VCO_HZ / PLL1_P_DIV, 400_000_000, "SYSCLK");
+        assert_eq!(SPI123_KER_HZ, 160_000_000, "NetLite C bootloader PLLQ=5");
+        assert!(SPI123_KER_HZ <= SPI123_KER_MAX_HZ);
+        assert_eq!(SPI1_SCK_HZ, 80_000_000);
+        // The pre-fix state (PLL1_Q at its reset value /2) would have been out of spec.
+        assert!(PLL1_VCO_HZ / 2 > SPI123_KER_MAX_HZ);
+    }
 }

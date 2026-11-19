@@ -9,9 +9,9 @@
 use boot_abi::*;
 use boot_core::{decide, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
-use boot_journal::{JournalManager, SlotJournalState};
+use boot_journal::{JournalError, JournalManager, SlotJournalState};
 use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
-use boot_nor::{NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
+use boot_nor::{NorError, NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
 use boot_stm32h7::{
     uart_write_u32, init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
     init_usart1, is_key2_pressed, jump_to_app, poll_millis, read_mcu_uid, set_led, set_nor_cs,
@@ -190,16 +190,36 @@ unsafe extern "C" fn abi_slot_status(slot: u8, out: *mut SlotInfo) -> i32 {
     }
     // Replay journal with temporary driver
     let mut driver = SpiNorIoOpsDriver::new(&LOCAL_IO_OPS);
-    if let Ok(journal) = JournalManager::init(&mut driver, layout()) {
-        let state = if slot == 0 { journal.slot_a } else { journal.slot_b };
-        (*out).slot_id = slot;
-        (*out).state = state.state;
-        (*out).trial_count = state.trial;
-        (*out).img_version = state.img_ver;
-        (*out).min_version = state.min_version;
-        BOOT_OK
-    } else {
-        ERR_NOR_IO
+    match JournalManager::init(&mut driver, layout()) {
+        Ok(journal) => {
+            let state = if slot == 0 { journal.slot_a } else { journal.slot_b };
+            (*out).slot_id = slot;
+            (*out).state = state.state;
+            (*out).trial_count = state.trial;
+            (*out).img_version = state.img_ver;
+            (*out).min_version = state.min_version;
+            BOOT_OK
+        }
+        Err(e) => {
+            // Name the cause: every journal error is returned as ERR_NOR_IO.
+            uart_write_str("[BL-ABI] slot_status: journal init failed: ");
+            uart_write_str(journal_err_name(&e));
+            uart_write_str("\r\n");
+            ERR_NOR_IO
+        }
+    }
+}
+
+fn journal_err_name(e: &JournalError) -> &'static str {
+    match e {
+        JournalError::Nor(NorError::IoError) => "Nor(IoError)",
+        JournalError::Nor(NorError::NoTransport) => "Nor(NoTransport)",
+        JournalError::Nor(NorError::Timeout) => "Nor(Timeout)",
+        JournalError::Nor(_) => "Nor(other)",
+        JournalError::Corrupted => "Corrupted",
+        JournalError::NoValidSector => "NoValidSector",
+        JournalError::InvalidSlot => "InvalidSlot",
+        JournalError::BadLayout => "BadLayout",
     }
 }
 
