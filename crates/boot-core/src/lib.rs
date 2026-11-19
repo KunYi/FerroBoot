@@ -85,6 +85,37 @@ pub fn decide(
     }
 }
 
+/// What the bootloader has to journal just before it starts a slot that is on trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrialStep {
+    /// State to record (always `SLOT_STATE_TESTING`).
+    pub new_state: u8,
+    /// Trial count after this boot; also what the application sees in `BootInfo`.
+    pub new_trial: u8,
+}
+
+/// Bookkeeping for booting `s`: `Some` when the slot is on trial and this boot must be
+/// counted (and the watchdog armed), `None` for a slot that needs nothing recorded.
+///
+/// A `Pending` slot becomes `Testing` with trial 1. A slot that is already `Testing` and
+/// still has trials left gets its count incremented on every further boot, so an image
+/// that never confirms uses up `max_trials` boots and `decide()` then stops choosing it.
+/// (Until now only `Pending` was counted, so a `Testing` image that hung stayed
+/// selectable forever, and the watchdog was not armed for its later boots.)
+pub fn trial_step(s: &SlotJournalState, max_trials: u8) -> Option<TrialStep> {
+    match s.state {
+        SLOT_STATE_PENDING => Some(TrialStep {
+            new_state: SLOT_STATE_TESTING,
+            new_trial: s.trial.saturating_add(1),
+        }),
+        SLOT_STATE_TESTING if s.trial < max_trials => Some(TrialStep {
+            new_state: SLOT_STATE_TESTING,
+            new_trial: s.trial.saturating_add(1),
+        }),
+        _ => None,
+    }
+}
+
 fn is_slot_bootable(s: &SlotJournalState, max_trials: u8) -> bool {
     match s.state {
         SLOT_STATE_PENDING => true,
@@ -553,5 +584,64 @@ mod tests {
                 assert_eq!(decide(a, b, 3), BootDecision::EnterRescue);
             }
         }
+    }
+
+    fn st(state: u8, trial: u8) -> SlotJournalState {
+        slot(state, trial, 1, 0, 0, 1)
+    }
+
+    #[test]
+    fn trial_step_counts_pending_and_testing_boots() {
+        let step = |state, trial| trial_step(&st(state, trial), DEFAULT_MAX_TRIALS);
+        let testing = |n| Some(TrialStep { new_state: SLOT_STATE_TESTING, new_trial: n });
+        assert_eq!(step(SLOT_STATE_PENDING, 0), testing(1));
+        assert_eq!(step(SLOT_STATE_TESTING, 1), testing(2));
+        assert_eq!(step(SLOT_STATE_TESTING, 2), testing(3));
+        // Out of trials: decide() will not pick it, and nothing is recorded for it.
+        assert_eq!(step(SLOT_STATE_TESTING, 3), None);
+        assert_eq!(step(SLOT_STATE_CONFIRMED, 0), None);
+        assert_eq!(step(SLOT_STATE_CONFIRMED, 1), None);
+        assert_eq!(step(boot_abi::SLOT_STATE_EMPTY, 0), None);
+        assert_eq!(step(boot_abi::SLOT_STATE_INVALID, 0), None);
+    }
+
+    /// Boots `N` times the way the bootloader does (decide, then journal the trial) with an
+    /// application that never confirms; returns the slot chosen on each boot (0xFF = rescue).
+    fn boots_without_confirm<const N: usize>(mut a: SlotJournalState, mut b: SlotJournalState) -> [u8; N] {
+        let mut chosen = [0xFFu8; N];
+        for c in chosen.iter_mut() {
+            let primary = match decide(&a, &b, DEFAULT_MAX_TRIALS) {
+                BootDecision::TryCandidates { primary, .. } => primary,
+                BootDecision::EnterRescue => break,
+            };
+            *c = primary;
+            let target = if primary == BOOT_SLOT_A { &mut a } else { &mut b };
+            if let Some(step) = trial_step(target, DEFAULT_MAX_TRIALS) {
+                target.state = step.new_state;
+                target.trial = step.new_trial;
+            }
+        }
+        chosen
+    }
+
+    #[test]
+    fn an_image_that_never_confirms_is_abandoned_after_max_trials() {
+        // New image in A (Pending), known-good image in B (Confirmed).
+        let a = st(SLOT_STATE_PENDING, 0);
+        let b = st(SLOT_STATE_CONFIRMED, 0);
+        assert_eq!(
+            boots_without_confirm::<6>(a, b),
+            [BOOT_SLOT_A, BOOT_SLOT_A, BOOT_SLOT_A, BOOT_SLOT_B, BOOT_SLOT_B, BOOT_SLOT_B]
+        );
+        // Same when the bad image is already Testing with one trial used.
+        let a = st(SLOT_STATE_TESTING, 1);
+        assert_eq!(
+            boots_without_confirm::<4>(a, b),
+            [BOOT_SLOT_A, BOOT_SLOT_A, BOOT_SLOT_B, BOOT_SLOT_B]
+        );
+        // Nothing to fall back to: both images bad -> rescue once the trials are gone.
+        let a = st(SLOT_STATE_TESTING, 2);
+        let b = st(SLOT_STATE_TESTING, 2);
+        assert_eq!(boots_without_confirm::<3>(a, b), [BOOT_SLOT_A, BOOT_SLOT_B, 0xFF]);
     }
 }

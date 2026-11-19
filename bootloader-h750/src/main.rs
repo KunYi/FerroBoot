@@ -7,7 +7,7 @@
 #![no_main]
 
 use boot_abi::*;
-use boot_core::{decide, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
+use boot_core::{decide, trial_step, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
 use boot_journal::{JournalError, JournalManager, SlotJournalState};
 use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
@@ -527,26 +527,30 @@ fn main() -> ! {
 
     uart_write_str("[BL] Slot verified successfully. Preparing jump.\r\n");
 
-    // 7. Update Journal if Pending -> Testing
+    // 7. Count this boot if the slot is on trial (Pending -> Testing, and every further
+    //    Testing boot), and arm the watchdog so a hanging image resets back to us.
     let target_state = if boot_slot == 0 { journal.slot_a } else { journal.slot_b };
-    let is_trial = target_state.state == SLOT_STATE_PENDING;
-    if is_trial {
+    let step = trial_step(&target_state, DEFAULT_MAX_TRIALS);
+    if let Some(step) = step {
         let trial_res = journal.append_record(
             &mut nor_driver,
             boot_slot,
-            SLOT_STATE_TESTING,
-            target_state.trial + 1,
+            step.new_state,
+            step.new_trial,
             0,
             parsed_img.header.ih_ver,
             0,
             0,
         );
-        // Diagnostic (E.1): a failed Testing record used to be dropped silently.
         uart_write_str(if trial_res.is_ok() {
-            "[BL] Pending -> Testing recorded.\r\n"
+            "[BL] Trial recorded: "
         } else {
-            "[BL] WARN: Pending -> Testing record FAILED.\r\n"
+            "[BL] WARN: trial record FAILED: "
         });
+        uart_write_u32(u32::from(step.new_trial));
+        uart_write_str("/");
+        uart_write_u32(u32::from(DEFAULT_MAX_TRIALS));
+        uart_write_str("\r\n");
         // Start watchdog for test boot
         Iwdg::start(3000);
     }
@@ -558,7 +562,7 @@ fn main() -> ! {
         size: core::mem::size_of::<BootInfo>() as u16,
         boot_slot,
         boot_reason: BOOT_REASON_NORMAL,
-        trial_count: target_state.trial + (if is_trial { 1 } else { 0 }),
+        trial_count: step.map_or(target_state.trial, |t| t.new_trial),
         reserved0: 0,
         img_version: parsed_img.header.ih_ver,
         bl_version: BOOTLOADER_INFO.bl_version,
