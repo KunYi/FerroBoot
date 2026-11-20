@@ -17,6 +17,7 @@ Usage:
   python3 rescue_upload.py --port /dev/ttyUSB0 --image app_signed.bin --slot 0
 """
 import argparse
+import struct
 import sys
 import time
 
@@ -28,6 +29,17 @@ CHUNK = 512
 MAX_IMAGE = 0xA0000
 ERASE_TIMEOUT = 40.0   # 10 blocks x up to ~2 s (NOR block erase), plus margin
 MARK_TIMEOUT = 20.0    # 'm' runs the full signature verification of the image
+
+
+def header_version(img):
+    """Version stored in the 32-byte image header (ImageHeader.ih_ver) as 'maj.min.rev+build'.
+
+    Layout (boot-image ImageHeader, little endian): magic u32 @0, load_addr u32 @4,
+    hdr_size u16 @8, protect_tlv_size u16 @10, img_size u32 @12, flags u32 @16, then
+    major u8 @20, minor u8 @21, revision u16 @22, build_num u32 @24.
+    """
+    major, minor, rev, build = struct.unpack_from("<BBHI", img, 20)
+    return f"{major}.{minor}.{rev}+{build}"
 
 
 def read_line(ser, timeout):
@@ -65,8 +77,11 @@ def main():
     img = open(args.image, "rb").read()
     if len(img) > MAX_IMAGE:
         sys.exit(f"Image is {len(img)} bytes; a slot holds at most {MAX_IMAGE}.")
-    if int.from_bytes(img[:4], "little") != 0x96F3B83D:
+    if len(img) < 32 or int.from_bytes(img[:4], "little") != 0x96F3B83D:
         sys.exit("Not a signed image (bad header magic). Run xtask sign first.")
+    # xtask sign defaults to 1.0.0+1 unless --major/--minor/--rev/--build are given, so two
+    # images signed without them look identical to the bootloader's journal.
+    print(f"Image {args.image}: {len(img)} bytes, version {header_version(img)}")
 
     ser = serial.Serial(args.port, args.baud, timeout=0.05)
     ser.reset_input_buffer()

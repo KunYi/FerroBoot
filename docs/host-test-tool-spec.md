@@ -330,35 +330,34 @@ The Host must use stop-and-wait transfer:
 
 Never send the next chunk before receiving the previous chunk's ACK.
 
-### 6.1 Important Existing Protocol Limitations
+### 6.1 Protocol Behaviour and Former Limitations
 
-The current Bootloader implementation has several limitations that must be tracked as firmware issues.
+Earlier Bootloaders had defects in the rescue commands. They are fixed in the Bootloader (`boot-rescue`
+crate and `enter_rescue_mode`); there is no firmware version query yet, so the Host cannot tell an old
+Bootloader from a fixed one and must treat any reply other than `OK` as a failure.
 
-**E command**
+**E command** `e <slot>`
 
-Currently erases only the first 64KB block of a Slot.
+Erases the whole Slot (every 64KB block; 10 blocks on the H750 NetLite) and answers `OK` afterwards. It takes
+several seconds (64KB block erase: typical 180 ms, worst case 2 s), so the Host must wait up to about 40 s.
+Older Bootloaders erased only the first 64KB block of a 640KB Slot.
 
-The actual Slot size is 640KB.
+**W command** `w <slot> <offset_hex> <len_hex>\n<bytes>`
 
-The Host must not assume that the entire Slot has been erased.
+The whole write must lie inside the Slot and be 1..512 bytes. Replies: `OK`, `ERR_SLOT`, `ERR_LEN`,
+`ERR_RANGE`, `ERR_WR`. A refused write still reads and drops its announced payload (at most 4096 bytes), so
+the Host stays in sync. Older Bootloaders did no range check and cut a longer length to 512, which could write
+outside the Slot and desynchronize the Host.
 
-**W command**
+**M command** `m <slot>`
 
-Currently does not perform complete offset and Slot-boundary validation.
+Runs the full image verification, then marks the Slot Pending with the version from the image header.
+Replies: `OK`, `ERR_SLOT`, `ERR_VERIFY`, `ERR_JRN`, `ERR_INIT`. The reply is a single line; use `j` to see the
+journaled version. Older Bootloaders wrote a fixed `1.0.0+1` without looking at the image.
 
-If the received length exceeds 512 bytes, the firmware limits the read to 512 bytes. This can desynchronize the Host and Device.
+**Slot argument**
 
-**M command**
-
-Currently writes a hardcoded image version:
-
-`1.0.0+1`
-
-It does not extract the version from the uploaded image and does not perform complete image verification before marking Pending.
-
-These are Bootloader defects, not issues that should be hidden by Python-side workarounds.
-
-The tool must display a warning when using the current unsafe erase/write/mark implementation.
+Exactly `0` or `1`, otherwise `ERR_SLOT`. Older Bootloaders treated every other byte as Slot 1.
 
 ## 7. Device Information and Slot Inspection
 

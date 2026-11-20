@@ -5,6 +5,7 @@ CHIP         := STM32H750VBTx
 PROBE_RS     := probe-rs
 CARGO_FLAGS  := --release --locked
 PORT         := /dev/ttyACM0
+SLOT         ?= 0
 
 # Artifact paths
 RELEASE_DIR  := target/$(TARGET)/release
@@ -68,7 +69,7 @@ sign: $(APP_SIGNED)
 
 # Upload the signed image using the Python rescue utility
 upload: $(APP_SIGNED)
-	python3 $(RESCUE_PY) --port $(PORT) --image $(APP_SIGNED) --slot 0
+	python3 $(RESCUE_PY) --port $(PORT) --image $(APP_SIGNED) --slot $(SLOT)
 
 # Remove Cargo build artifacts and generated application images
 clean:
