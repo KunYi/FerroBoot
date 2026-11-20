@@ -8,6 +8,7 @@
 
 use boot_abi::*;
 use boot_core::{decide, trial_step, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
+use boot_rescue::{drain_len, parse_slot, slot_erase_blocks, write_address};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
 use boot_journal::{JournalError, JournalManager, SlotJournalState};
 use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
@@ -580,6 +581,15 @@ fn main() -> ! {
     }
 }
 
+/// Next rescue argument byte, skipping blanks.
+fn read_arg_byte() -> u8 {
+    let mut c = uart_read_byte_blocking();
+    while c == b' ' || c == b'\t' {
+        c = uart_read_byte_blocking();
+    }
+    c
+}
+
 fn print_slot_state(name: &str, s: &SlotJournalState) {
     uart_write_str("[BL] J ");
     uart_write_str(name);
@@ -661,25 +671,37 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                 uart_write_str("[RESCUE] BL v1.0, STM32H750, NOR BY25Q32ES\r\n");
             }
             b'e' | b'E' => {
-                // Erase slot block 0: e <slot>\n
-                let mut slot = uart_read_byte_blocking();
-                while slot == b' ' || slot == b'\t' {
-                    slot = uart_read_byte_blocking();
+                // Erase a whole slot (every 64 KiB block of it): e <slot>\n
+                let slot = match parse_slot(read_arg_byte()) {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        uart_write_str(e.reply());
+                        uart_write_str("\r\n");
+                        continue;
+                    }
+                };
+                let blocks = match slot_erase_blocks(layout(), slot) {
+                    Ok(blocks) => blocks,
+                    Err(e) => {
+                        uart_write_str(e.reply());
+                        uart_write_str("\r\n");
+                        continue;
+                    }
+                };
+                let mut ok = true;
+                for addr in blocks {
+                    Iwdg::kick();
+                    if nor.erase_block_64k(addr).is_err() {
+                        ok = false;
+                        break;
+                    }
                 }
-                let base = layout().slots[usize::from(slot != b'0')].offset;
-                if nor.erase_block_64k(base).is_ok() {
-                    uart_write_str("OK\r\n");
-                } else {
-                    uart_write_str("ERR\r\n");
-                }
+                Iwdg::kick();
+                uart_write_str(if ok { "OK\r\n" } else { "ERR\r\n" });
             }
             b'w' | b'W' => {
-                // Write chunk: w <slot> <offset_hex> <len_hex>\n<bytes>
-                let mut slot = uart_read_byte_blocking();
-                while slot == b' ' || slot == b'\t' {
-                    slot = uart_read_byte_blocking();
-                }
-                let slot_base = layout().slots[usize::from(slot != b'0')].offset;
+                // Write chunk: w <slot> <offset_hex> <len_hex>\n<bytes>   (len <= 512)
+                let slot = parse_slot(read_arg_byte());
                 let (offset, _) = match read_delimited_hex() {
                     (Some(o), d) => (o, d),
                     (None, _) => {
@@ -698,47 +720,79 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                     delim = uart_read_byte_blocking();
                 }
 
+                // Refuse anything that is not a whole write inside the slot. The payload the
+                // host is about to send is read and dropped first: left in the UART it would
+                // be taken for commands (it can contain 'e', 'w', 'm', 'r').
+                let addr = match slot.and_then(|s| write_address(layout(), s, offset, len)) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        for _ in 0..drain_len(len) {
+                            uart_read_byte_blocking();
+                        }
+                        uart_write_str(e.reply());
+                        uart_write_str("\r\n");
+                        continue;
+                    }
+                };
+
                 let mut buf = [0u8; 512];
-                let to_read = len.min(512) as usize;
-                for b in buf.iter_mut().take(to_read) {
+                let n = len as usize; // write_address guarantees 1..=512
+                for b in buf.iter_mut().take(n) {
                     *b = uart_read_byte_blocking();
                 }
-                if nor.write(slot_base + offset, &buf[..to_read]).is_ok() {
+                if nor.write(addr, &buf[..n]).is_ok() {
                     uart_write_str("OK\r\n");
                 } else {
                     uart_write_str("ERR_WR\r\n");
                 }
             }
             b'm' | b'M' => {
-                // Mark slot as pending in journal: m <slot>\n
-                let mut slot_char = uart_read_byte_blocking();
-                while slot_char == b' ' || slot_char == b'\t' {
-                    slot_char = uart_read_byte_blocking();
-                }
-                let slot_id = if slot_char == b'0' { 0 } else { 1 };
-                if let Ok(mut journal) = JournalManager::init(&mut nor, layout()) {
-                    let res = journal.append_record(
-                        &mut nor,
-                        slot_id,
-                        SLOT_STATE_PENDING,
-                        0,
-                        0,
-                        ImageVersion {
-                            major: 1,
-                            minor: 0,
-                            revision: 0,
-                            build_num: 1,
-                        },
-                        0,
-                        0,
-                    );
-                    if res.is_ok() {
-                        uart_write_str("OK\r\n");
-                    } else {
-                        uart_write_str("ERR_JRN\r\n");
+                // Mark a slot Pending in the journal: m <slot>\n
+                // Only an image that passes full verification is marked, and the journal gets
+                // the version from its header (it used to be a fixed 1.0.0+1 for any content).
+                let slot = match parse_slot(read_arg_byte()) {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        uart_write_str(e.reply());
+                        uart_write_str("\r\n");
+                        continue;
                     }
-                } else {
-                    uart_write_str("ERR_INIT\r\n");
+                };
+                Iwdg::kick();
+                let version = {
+                    let mut loader = SlotLoader::new(
+                        &mut nor,
+                        &PUBLIC_KEY_TABLE,
+                        &SECRETS_STORAGE.global_secret,
+                        read_mcu_uid(),
+                        layout(),
+                        BOOTLOADER_INFO.bl_version,
+                    );
+                    let load = ram_load_region();
+                    let ram = unsafe {
+                        core::slice::from_raw_parts_mut(load.base as *mut u8, load.len as usize)
+                    };
+                    loader.load_and_verify(slot, ram, false).map(|p| p.header.ih_ver)
+                };
+                Iwdg::kick();
+                match version {
+                    Err(_) => uart_write_str("ERR_VERIFY\r\n"),
+                    Ok(ver) => match JournalManager::init(&mut nor, layout()) {
+                        Ok(mut journal) => {
+                            let res = journal.append_record(
+                                &mut nor,
+                                slot,
+                                SLOT_STATE_PENDING,
+                                0,
+                                0,
+                                ver,
+                                0,
+                                0,
+                            );
+                            uart_write_str(if res.is_ok() { "OK\r\n" } else { "ERR_JRN\r\n" });
+                        }
+                        Err(_) => uart_write_str("ERR_INIT\r\n"),
+                    },
                 }
             }
             b'j' | b'J' => {

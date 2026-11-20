@@ -228,6 +228,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-rescue"
+version = "0.1.0"
+dependencies = [
+ "boot-layout",
+]
+
+[[package]]
 name = "boot-stm32h7"
 version = "0.2.0"
 dependencies = [
@@ -269,6 +276,7 @@ dependencies = [
  "boot-journal",
  "boot-layout",
  "boot-nor",
+ "boot-rescue",
  "boot-stm32h7",
  "boot-update",
  "cortex-m",

@@ -10,6 +10,7 @@ members = [
     "crates/boot-nor",
     "crates/boot-journal",
     "crates/boot-core",
+    "crates/boot-rescue",
     "crates/boot-update",
     "crates/boot-api-client",
     "crates/boot-stm32h7",
@@ -63,6 +64,7 @@ boot-time = { path = "crates/boot-time" }
 boot-nor = { path = "crates/boot-nor" }
 boot-journal = { path = "crates/boot-journal" }
 boot-core = { path = "crates/boot-core" }
+boot-rescue = { path = "crates/boot-rescue" }
 boot-update = { path = "crates/boot-update" }
 boot-api-client = { path = "crates/boot-api-client" }
 boot-stm32h7 = { path = "crates/boot-stm32h7" }

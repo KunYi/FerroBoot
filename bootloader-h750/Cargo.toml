@@ -25,5 +25,6 @@ boot-crypto = { workspace = true }
 boot-nor = { workspace = true }
 boot-journal = { workspace = true }
 boot-core = { workspace = true }
+boot-rescue = { workspace = true }
 boot-update = { workspace = true }
 boot-stm32h7 = { workspace = true }

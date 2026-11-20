@@ -27,6 +27,7 @@ board address (see `boot-layout`). All structure sizes are unchanged.
 | `boot-nor` | 0.2.0 | owns SPI-NOR geometry; optional transport (`NorError::NoTransport`) |
 | `boot-core` | 0.2.0 | `SlotLoader::new(.., &Layout, ..)` |
 | `boot-update` | 0.2.0 | `UpdateSession::new(&'static Layout)` |
+| `boot-rescue` | 0.1.0 | pure UART-rescue helpers: slot argument, write range, slot erase (new) |
 | `boot-crypto` | 0.1.0 | unchanged |
 | `boot-api-client` | 0.2.0 | `BootApiClient::at(addr)` replaces `new()` |
 | `boot-stm32h7` | 0.2.0 | `init_poll_millis()`/`poll_millis()`; owns SRAM4 constants |

@@ -3,10 +3,14 @@
 
 Rescue protocol (see bootloader-h750/src/main.rs, enter_rescue_mode):
   p            -> "PONG"
-  e <slot>     -> erases the FIRST 64KB block of the slot -> "OK"
-  w <slot> <off_hex> <len_hex>\n<bytes>   (len <= 512)    -> "OK"
-  m <slot>     -> mark slot Pending in the journal        -> "OK"
+  e <slot>     -> erases the WHOLE slot (every 64KB block, takes seconds) -> "OK"
+  w <slot> <off_hex> <len_hex>\n<bytes>   (1 <= len <= 512, must stay inside the slot)
+               -> "OK", or ERR_SLOT / ERR_LEN / ERR_RANGE / ERR_WR
+  m <slot>     -> verify the image in the slot, then mark it Pending in the journal
+                  with the version from its header -> "OK", or ERR_VERIFY / ERR_JRN / ERR_INIT
+  j            -> dump the journal (several lines; run it by hand to see the versions)
   r            -> reboot
+Slot is exactly "0" or "1"; anything else is answered with ERR_SLOT.
 
 Usage:
   pip install pyserial
@@ -19,7 +23,11 @@ import time
 import serial
 
 CHUNK = 512
-MAX_IMAGE = 64 * 1024  # rescue 'e' only erases one 64KB block
+# A slot is 640 KiB on the H750 NetLite (boot-layout H750_NETLITE); the bootloader refuses
+# writes outside the slot, and 'm' refuses an image that does not verify.
+MAX_IMAGE = 0xA0000
+ERASE_TIMEOUT = 40.0   # 10 blocks x up to ~2 s (NOR block erase), plus margin
+MARK_TIMEOUT = 20.0    # 'm' runs the full signature verification of the image
 
 
 def read_line(ser, timeout):
@@ -56,7 +64,7 @@ def main():
 
     img = open(args.image, "rb").read()
     if len(img) > MAX_IMAGE:
-        sys.exit(f"Image is {len(img)} bytes; rescue erase only clears 64KB.")
+        sys.exit(f"Image is {len(img)} bytes; a slot holds at most {MAX_IMAGE}.")
     if int.from_bytes(img[:4], "little") != 0x96F3B83D:
         sys.exit("Not a signed image (bad header magic). Run xtask sign first.")
 
@@ -65,8 +73,8 @@ def main():
 
     print("Ping...")
     cmd(ser, b"p", "PONG")
-    print(f"Erasing slot {args.slot} (up to 2 s)...")
-    cmd(ser, f"e {args.slot}\n".encode(), "OK", timeout=6.0)
+    print(f"Erasing slot {args.slot} (whole slot, up to ~{int(ERASE_TIMEOUT)} s)...")
+    cmd(ser, f"e {args.slot}\n".encode(), "OK", timeout=ERASE_TIMEOUT)
 
     off = 0
     while off < len(img):
@@ -82,8 +90,8 @@ def main():
     print()
 
     if not args.no_mark:
-        print("Marking slot Pending...")
-        cmd(ser, f"m {args.slot}\n".encode(), "OK")
+        print("Verifying and marking slot Pending...")
+        cmd(ser, f"m {args.slot}\n".encode(), "OK", timeout=MARK_TIMEOUT)
     if not args.no_reboot:
         print("Rebooting...")
         ser.write(b"r\n")
