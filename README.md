@@ -229,7 +229,8 @@ python3 tools/rescue_upload.py \
 
 **UART rescue:** `e` erases the whole slot (every 64KB block, so it takes seconds), `w` refuses writes that
 leave the slot, and `m` verifies the image before marking it Pending, using the version stored in the image
-header. An image can be as large as the slot (640KB on the H750 NetLite). `xtask sign` signs every image as
+header. The size limit on the H750 NetLite is the 512KB AXI SRAM window the image is loaded into, not the
+640KB slot; `rescue_upload.py` warns before uploading a larger image. `xtask sign` signs every image as
 `1.0.0+1` unless `--major`, `--minor`, `--rev` or `--build` are given, and the bootloader journals exactly that
 version, so two images signed without them are indistinguishable in the journal (`j`). `rescue_upload.py` prints
 the version it is about to upload.

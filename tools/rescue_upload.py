@@ -24,9 +24,12 @@ import time
 import serial
 
 CHUNK = 512
-# A slot is 640 KiB on the H750 NetLite (boot-layout H750_NETLITE); the bootloader refuses
-# writes outside the slot, and 'm' refuses an image that does not verify.
-MAX_IMAGE = 0xA0000
+# H750 NetLite (boot-layout H750_NETLITE). A slot is 640 KiB and the bootloader refuses writes
+# outside it, but the image must also fit the 512 KiB AXI SRAM window it is loaded into
+# (boot-image validate(); pinned by h750_effective_image_limit_is_the_512k_ram_window...), so
+# anything larger is refused by 'm' with ERR_VERIFY after the whole upload.
+SLOT_SIZE = 0xA0000
+RAM_WINDOW = 512 * 1024
 ERASE_TIMEOUT = 40.0   # 10 blocks x up to ~2 s (NOR block erase), plus margin
 MARK_TIMEOUT = 20.0    # 'm' runs the full signature verification of the image
 
@@ -40,6 +43,16 @@ def header_version(img):
     """
     major, minor, rev, build = struct.unpack_from("<BBHI", img, 20)
     return f"{major}.{minor}.{rev}+{build}"
+
+
+def size_problem(n):
+    """None if an image of n bytes can be uploaded and run; otherwise ('error'|'warning', text)."""
+    if n > SLOT_SIZE:
+        return ("error", f"a slot holds at most {SLOT_SIZE} bytes")
+    if n > RAM_WINDOW:
+        return ("warning", f"larger than the {RAM_WINDOW}-byte RAM window; 'm' will probably "
+                           "answer ERR_VERIFY after the upload")
+    return None
 
 
 def read_line(ser, timeout):
@@ -75,13 +88,16 @@ def main():
     args = ap.parse_args()
 
     img = open(args.image, "rb").read()
-    if len(img) > MAX_IMAGE:
-        sys.exit(f"Image is {len(img)} bytes; a slot holds at most {MAX_IMAGE}.")
+    problem = size_problem(len(img))
+    if problem and problem[0] == "error":
+        sys.exit(f"Image is {len(img)} bytes; {problem[1]}.")
     if len(img) < 32 or int.from_bytes(img[:4], "little") != 0x96F3B83D:
         sys.exit("Not a signed image (bad header magic). Run xtask sign first.")
     # xtask sign defaults to 1.0.0+1 unless --major/--minor/--rev/--build are given, so two
     # images signed without them look identical to the bootloader's journal.
     print(f"Image {args.image}: {len(img)} bytes, version {header_version(img)}")
+    if problem:
+        print(f"WARNING: image is {len(img)} bytes, {problem[1]}.")
 
     ser = serial.Serial(args.port, args.baud, timeout=0.05)
     ser.reset_input_buffer()

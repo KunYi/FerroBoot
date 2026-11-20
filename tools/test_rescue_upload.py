@@ -31,5 +31,15 @@ class HeaderVersion(unittest.TestCase):
         self.assertEqual(rescue_upload.header_version(bytes(hdr)), "9.8.4660+305419896")
 
 
+class SizeLimits(unittest.TestCase):
+    def test_ram_window_is_the_practical_limit_and_slot_the_hard_one(self):
+        self.assertEqual(rescue_upload.RAM_WINDOW, 512 * 1024)
+        self.assertEqual(rescue_upload.SLOT_SIZE, 640 * 1024)
+        self.assertIsNone(rescue_upload.size_problem(512 * 1024))
+        self.assertEqual(rescue_upload.size_problem(512 * 1024 + 1)[0], "warning")
+        self.assertEqual(rescue_upload.size_problem(640 * 1024)[0], "warning")
+        self.assertEqual(rescue_upload.size_problem(640 * 1024 + 1)[0], "error")
+
+
 if __name__ == "__main__":
     unittest.main()
