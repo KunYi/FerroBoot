@@ -1,9 +1,17 @@
 # FerroBoot：BSP 分離與多平台（RAM_LOAD / XIP）擴展規劃
 
-> 狀態：**草案 v0.11，供討論**（尚未有任何程式碼變更）
-> 基準：最初上傳的 repo 為 `10ba7bc`；**目前以 GitHub `KunYi/FerroBoot` 的 `main`（`12536f5`，2026-11-16）為準**，其中已包含 P0 的三個 patch 與 P1a（patch 0004）
+> 狀態：**草案 v0.12，供討論**（P0、P1 與附錄 E.1 的修復已併入 `main`；P2 之後尚未開始）
+> 基準：最初上傳的 repo 為 `10ba7bc`；**目前以 GitHub `KunYi/FerroBoot` 的 `main` 為準（撰寫時在 `54b9a20` 之上，2026-11-20）**，其中已包含 P0、P1a、P1b 與附錄 E.1 的修復
 > 範圍：把 `H750 NetLite（RAM_LOAD）` 與 `NUCLEO-F429ZI（內部 Flash XIP）` 放進同一個架構；`Forlinx OK1061-S（i.MX RT1061，FlexSPI NOR XIP）` 先在架構上預留、**後做**
 > 標註約定：**[已讀碼]** 來自原始碼；**[已查]** 本版以網路資料交叉查證過（來源見附錄 A，仍建議最後對照原廠手冊）；**[假設]** 我的推論；**[待查證]** 憑記憶，動工前必須對照手冊；**[TBD-n]** 你明確決定「拿到板子再定」的項目（§0.3）
+
+### v0.12 變更紀錄
+
+- **附錄 E.1 結案**：根因不是單一問題，而是三層串在一起（SPI1 在 App 內讀取失敗 → App 從未 confirm；Bootloader 不累計 Testing 的 trial；`m` 寫死版本 + `decide()` 同版本偏好 slot A）。三層都已修並在實機看過結果，**但各項的驗證程度不同**，見 E.1「驗證狀態」。
+- **各假設的結果**：H1 成立（以 H1b 的形式）；H2 **不是這次的主因**（上傳工具限制 64KB，剛好被 `e` 涵蓋），但缺陷屬實並已修；H3 沒有成立證據，**但 SPI 問題沒有做基線二分**，所以不知道它是否原本就存在。
+- **§1.4 更新**：新增已修項目（Testing 不計 trial、rescue `w`／`e`／`m` 與 slot 參數、SPI1 重新初始化），並更正兩條過時的紀錄（rescue 只擦 64KB、`m` 寫死版本）。
+- **新增「後續參考」**：`decide()` 同狀態同版本的選擇規則（a／b／c），**決策為維持現狀（a）**，以 2026-11-20 的實機 log 為依據記錄；以及 `slot_status` 走 Bootloader 自己的 SPI 這個 ABI 設計問題。
+- §9 P2 列註記哪些已提早完成；§12 下一步行動重排。
 
 ### v0.11 變更紀錄
 
@@ -204,9 +212,15 @@ tools/xtask (sign/encrypt/size-check)   tools/host-update   tools/rescue_upload.
 - 觀察（**不修改，只記錄**）：`UpdateSession::finish()` **不驗簽**就把 slot 標為 Pending（`_keytable` 沒有被使用）。目前不影響安全，因為下次開機 `load_and_verify` 會完整驗證，驗證失敗就回退；但「驗證通過才標記 Pending」這個 plan 原本的語意尚未實作，屬於 M5 的 `update_*` ABI 工作。`UpdateSession` 在 patch 0004 之前沒有任何測試，也沒有呼叫端。
 - 觀察：repo 根目錄的 `tests/integration_test.rs` 是 `crates/boot-core/tests/integration_test.rs` 的**舊版重複**，而且不屬於任何 package（工作區根目錄沒有 `[package]`），所以**不會被編譯或執行**；它已經引用了被移除的符號，建議直接刪除。
 - `jump_to_app` 沒有實作 plan.md §6.1 的 cache clean/invalidate、`CONTROL` 清除；目前因為沒開 cache 所以無妨，但 RT1061（M7 + cache）會要求。這會被正式化為 `Platform::prepare_jump()`。
-- README 已記載「UART 救援每個 slot 只擦第一個 64KB block」。救援協議目前以「64KB block」為單位，與 F429 的 128KB sector 不相容；救援協議應改為以「slot 相對偏移」表達、擦除粒度交給 `Flash`。
+- ✅ **UART 救援 `e` 只擦 slot 的第一個 64KB block（已修，`2ab8509`）**：現在擦整個 slot（H750 為 10 個 64KB block）。**協議仍以 64KB block 為單位**，與 F429 的 128KB sector 不相容；P2 仍需把它改成「slot 相對偏移、擦除粒度交給 `Flash`」（`slot_erase_step()`）。H750 的實際 image 上限仍是 512KiB 的 RAM 視窗，不是 640KiB 的 slot（上傳腳本現在會在傳輸前警告）。
 - `docs/plan.md`（README 引用它，但在 git 中是**未追蹤**）與 `rust-bootloader-plan.md`（已追蹤）內容完全相同。建議：`git rm rust-bootloader-plan.md && git add docs/plan.md`。這一步**沒有放進 patch**，避免與你本機的狀態衝突。
-- 救援 `m` 指令寫入的版本號是寫死的 `1.0.0+1`。
+- ✅ **救援 `m` 寫死版本 `1.0.0+1` 且不驗證（已修，`2ab8509`）**：現在先做完整驗證，通過才用 image header 的版本標記 Pending；驗證失敗回 `ERR_VERIFY`。**注意**：`xtask sign` 預設簽成 `1.0.0+1`，Makefile 也不帶版本，所以沒有指定 `--major／--minor／--rev／--build` 簽出的 image 在 journal 裡完全一樣（見 E.1 的 tie-break 說明）。
+- ✅ **rescue `w` 沒有範圍檢查（已修，`2ab8509`）**：`slot_base + offset + len` 可以寫進 journal 或另一個 slot；`len` 超過 512 被靜默截斷，host 仍送完整酬載，剩餘 byte 會被迴圈當成指令（`e`／`w`／`m`／`r` 都是合法指令字元）。另外 slot 參數「不是 `'0'` 就是 slot 1」。現在由 `boot-rescue` crate 的純函式決定，有 host 測試。
+- ✅ **Testing 狀態不累計 trial、不啟動看門狗（已修，`d08c1b6`）**：Bootloader 只處理 `Pending → Testing`（`is_trial = state == PENDING`）。已經是 Testing 的 slot 之後每次開機 trial 不變、看門狗不啟動，`decide()` 的 `Testing && trial < max_trials` 永遠成立，**掛住或從不 confirm 的 image 永遠不會被放棄**。這個行為從最初匯入的版本就存在，不是重構造成。現在由 `boot-core::trial_step()` 決定。
+- ✅ **SPI1 被 Bootloader 用過後，App 內重新初始化會讓兩筆傳輸的讀取失敗（已修，`979553c`）**：`abi_slot_status()` 在 App 內失敗（`ERR_NOR_IO`）→ App 從未 confirm。細節與證據見 E.1。
+- 觀察（**不修改，只記錄**）：`abi_slot_status()` 沒有 `io` 參數，用的是 **Bootloader 自己的 SPI 驅動**，而 `abi_confirm()` 用 App 借出的 `IoOps`；ABI v2 的 `caps` 又標示 `CAP_IO_FROM_APP`。這個不一致正是 App 內 `slot_status` 受 SPI 狀態影響的原因之一。P3／P6 應決定：`slot_status` 改收 `io`，或改為讀 Bootloader 開機時存進 `BootInfo` 的快照。
+- 觀察（**不修改，只記錄**）：`jump_to_app` 現在對 SPI1 做 RCC reset，但其他 Bootloader 用過的週邊（USART1 只做 `UE=0`）沒有。這屬於 `Platform::prepare_jump()` 的範圍（上一條已提到 cache／`CONTROL`），P3 要一併處理。
+- 觀察（**不修改，只記錄**）：journal rollover 已在實機看到（`gen=2`、`next_seq=134`），兩個 slot 的狀態與版本在滾動後都保留。
 
 ---
 
@@ -781,9 +795,9 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 
 | 階段 | 內容 | DoD |
 |---|---|---|
-| **P0 基線與安全網** | 打 tag；記錄 H750 release 的 `.bin` hash/size；**size 組成分解已取得（§7.2）；`nm` 已驗證 `.rodata` 最大符號為 CRC 查表（0x4000）；在基線 tag 之後、作為獨立的一步，以 `boot-crc` 取代 `crc32fast`（同演算法，預期省約 15KiB），並以兩個板上 smoke test 與 host oracle 比對回歸**；host 測試全綠；補特性測試固定現有行為；**修 `local_millis`**（§1.4）；刪重複的 plan 文件。**狀態：patch 0001（`boot-crc`）、0002（時鐘）、0003（特性測試）已完成，等你在板上驗證；刪重複文件請依 §1.4 的兩行指令手動做** | 基線數據入庫；G0 的 log 存檔；板上 smoke test 通過 |
-| **P1 佈局資料化 + ABI v2**（✅ **完成：patch 0004、0005、0006**） | 新增 `boot-layout`；`boot-journal`/`boot-update`/`boot-core`/`boot-image`/`xtask` 改吃 `&Layout`；`boot-abi` 位址常數搬走；ABI v2（§5.4）；移除 `version.workspace`（§6.6）；`.secrets`／`.keytable` 位址改由 `Layout` 提供 | host 測試全過且**測試語意不變**；H750 功能等價 |
-| **P2 Flash 抽象 + 救援全 slot** | 新增 `boot-flash`（trait + `RamFlash`：不均勻 sector、memory-mapped 讀、bank swap 映射模擬）；`boot-nor` 實作它；journal/update 以 erase unit 為單位；`boot-rescue` 以 slot 相對偏移、整個 slot 擦寫，加入 `s`（status）指令骨架（§5.6、§5.7） | 斷電注入在「均勻 4KB」與「F429 式不均勻＋bank swap」兩組幾何上都通過；H750 救援可上傳 > 64KB 的 image |
+| **P0 基線與安全網** | 打 tag；記錄 H750 release 的 `.bin` hash/size；**size 組成分解已取得（§7.2）；`nm` 已驗證 `.rodata` 最大符號為 CRC 查表（0x4000）；在基線 tag 之後、作為獨立的一步，以 `boot-crc` 取代 `crc32fast`（同演算法，預期省約 15KiB），並以兩個板上 smoke test 與 host oracle 比對回歸**；host 測試全綠；補特性測試固定現有行為；**修 `local_millis`**（§1.4）；刪重複的 plan 文件。**狀態：`boot-crc`、時鐘、特性測試已完成，等你在板上驗證；刪重複文件請依 §1.4 的兩行指令手動做** | 基線數據入庫；G0 的 log 存檔；板上 smoke test 通過 |
+| **P1 佈局資料化 + ABI v2**（✅ **完成**） | 新增 `boot-layout`；`boot-journal`/`boot-update`/`boot-core`/`boot-image`/`xtask` 改吃 `&Layout`；`boot-abi` 位址常數搬走；ABI v2（§5.4）；移除 `version.workspace`（§6.6）；`.secrets`／`.keytable` 位址改由 `Layout` 提供 | host 測試全過且**測試語意不變**；H750 功能等價 |
+| **P2 Flash 抽象 + 救援全 slot**（部分已提早完成：`boot-rescue` 第一版與「整個 slot 擦除」已在 E.1 修復中做完，見附錄 E） | 新增 `boot-flash`（trait + `RamFlash`：不均勻 sector、memory-mapped 讀、bank swap 映射模擬）；`boot-nor` 實作它；journal/update 以 erase unit 為單位；`boot-rescue` 以 slot 相對偏移、整個 slot 擦寫，加入 `s`（status）指令骨架（§5.6、§5.7） | 斷電注入在「均勻 4KB」與「F429 式不均勻＋bank swap」兩組幾何上都通過；H750 救援可上傳 > 64KB 的 image |
 | **P3 Platform 抽象與 bin 瘦身** | 新增 `boot-platform`、`boot-runtime`；`bootloader-h750/main.rs` 縮成板級 glue；`boot-stm32h7` 改名並分出 app-facing 子集，抽出 `boot-stm32-common`；目錄遷到 `boards/h750-netlite/`；`Platform::protection_status()` 先在 H750 實作（RDP） | H750 端到端與基線一致；`main.rs` ≤ 約 100 行 |
 | **P4 執行模型與驗證管線** | `ExecModel::{RamLoad, XipRemap}`；`SlotLoader` 拆為 `ImageSource → Decrypt? → Sink → Hash → Verify`；`VerifyPolicy`（首次試開機 Quick）與 `KIND_VERIFIED` journal 記錄（CRC 範圍全包含）；`DeviceBinding` 選配；XIP 的 host 模擬（含 remap） | RamLoad 路徑輸出與基線**位元一致**；XIP 的 host 模擬可跑完 test→confirm→revert |
 | **P5 NUCLEO-F429ZI**（G0 之後） | **5a** `boot-flash-stm32`（F4 模組）、`boot-soc-stm32f4`、時脈（先保守頻率）、USART3、LED/按鍵，**Layout 用 B128**；**5b** 單 slot XIP 開機；**5c** bank swap A/B（S-F1 結論落地）；**5d** OTA 寫入路徑（TBD-1：RWW 或 RAM 常駐，依 S-F2）；**5e** Quick/Full 驗證、救援全 slot、斷電測試；**5f** 依實測 size 決定是否切到 T64（TBD-5）；**5g** 量產檢查（`protection_status`、`xtask prod-check`、`s` 指令） | 板上完成 A→B→revert 與隨機斷電；Quick/Full 耗時入文件；量產 profile size 與佈局決定入 ADR |
@@ -849,12 +863,12 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 
 ## 12. 下一步行動
 
-目前**沒有開放的決策問題**。P0、P1 已完成並併入 GitHub `main`（81 個 host 測試）。順序如下：
+目前**沒有開放的決策問題**（`decide()` 同版本規則的決策見附錄 E.1「後續參考」）。P0、P1 與附錄 E.1 的修復已併入 GitHub `main`（92 個 host 測試；`tools/test_rescue_upload.py` 另有 4 個 Python 測試。順序如下：
 
 | 順序 | 行動 | 負責 | 狀態／說明 |
 |---|---|---|---|
-| 1 | **調查並修復：UART rescue 上傳不同 slot 後都從 slot 0 開機／顯示有問題** | 下一個 task | **最優先**。見附錄 E |
-| 2 | P2：`boot-flash`（Flash trait）與救援全 slot | 下一個 task | 見 §9；其中「`e` 只擦第一個 64KB block」與附錄 E 的假設 H1 直接相關 |
+| 1 | **板上補驗證**：Testing → Testing（2/3、3/3、回退）、損毀 image 的 `ERR_VERIFY`、`ERR_RANGE`／`ERR_SLOT`、>64KB image 的整 slot 擦除、冷開機 | 你（需要板子）；我提供步驟 | 這些已有 host 測試，但**沒有板上紀錄**（E.1「驗證狀態」） |
+| 2 | P2：`boot-flash`（Flash trait）、`slot_erase_step()`、journal／update 以 erase unit 為單位 | 下一個 task | 見 §9；`boot-rescue` 已有第一版（純函式），P2 把它改成 slot 相對偏移並交給 `Flash` |
 | 3 | F429 spike S-F1～S-F3 | 你（需要板子）＋我寫測試程式 | G0 已通過，可以開始 |
 
 ## 13. 替代方案（為什麼不選）
@@ -975,23 +989,61 @@ F429 版的增減（拿掉裝置綁定；加入 F4 驅動、bank swap、`protect
 
 ## 附錄 E：已知問題追蹤
 
-### E.1 UART rescue 上傳不同 slot 後都從 slot 0 開機／顯示有問題（2026-11-17，實機回報）
+### E.1 UART rescue 上傳不同 slot 後都從 slot 0 開機／顯示有問題（2026-11-17 回報，✅ 2026-11-20 結案）
 
-**現象**：P0～P1 套用後，一般開機與跳轉到 Application 正常。但經 UART rescue 把 image 上傳到 slot 0 或 slot 1 後，結果都是 slot 0 開機，或顯示有問題（確切訊息待補）。
+**現象**：P0～P1 套用後，一般開機與跳轉到 Application 正常。但經 UART rescue 把 image 上傳到 slot 0 或 slot 1 後，結果都是 slot 0 開機。
 
-**尚未知道的事**：(a) 是否為重構造成，還是**原本就存在**（G0 當時只確認「rescue 上傳成功」，沒有分別驗證 slot 0／1 的開機結果）；(b) 上傳的 image 大小、版本、內容是否相同；(c) 上傳前兩個 slot 與 journal 的狀態；(d) 完整的 UART 開機 log。
+**根因（三層串在一起，缺一層現象就不同）**
 
-**依 `bootloader-h750/src/main.rs` 的 `enter_rescue_mode` 與 `decide()` 整理的假設**（以可能性與驗證成本排序，**都只是假設**）：
+1. **App 從未 confirm**：App 呼叫 ABI `slot_status()`，它在 App 內以 `-5`（`ERR_NOR_IO`，`Nor(IoError)`）失敗，App 把「呼叫失敗」和「不在 trial」都當成「不需要 confirm」，印出誤導的 "already confirmed"。結果 slot A 停在 Testing。
+2. **Bootloader 不累計 Testing 的 trial**：停在 Testing 的 A（trial < 3）永遠優先於新標記的 Pending B，而且沒有 trial 累計與看門狗，壞 image 永遠不會被放棄。
+3. **同版本時偏好 slot A**：`m` 寫死版本 `1.0.0+1`，`xtask sign` 又預設簽成 `1.0.0+1`，兩個 slot 同狀態同版本時 `decide()` 選 A（`both_confirmed_equal_versions_prefers_slot_a` 固定這個行為）。就算上面兩層都修好，**傳到 slot 1 → 啟動一次並 confirm → 再重開機，仍會回到 slot A**。
 
-| ID | 假設 | 依據 | 如何驗證 |
+**各假設的結果**
+
+| ID | 結果 | 說明 |
+|---|---|---|
+| H1 | ✅ 成立（H1b 的形式） | `m` 的版本寫死；兩個 slot 都 Confirmed 且版本相同時選 A。實機 log：B 被 confirm 後，下次開機兩邊同為 `1.0.0+1`，選了 A |
+| H2 | ➖ 不是這次的主因，缺陷屬實 | `rescue_upload.py` 當時限制 image ≤ 64KB，剛好被 `e` 擦除的那一個 block 涵蓋。`e` 只擦第一個 block 是真的缺陷，已修 |
+| H3 | ❌ 沒有成立證據 | Testing trial 的缺陷從最初匯入的版本就存在（`git log -S` 確認）。**SPI1 的問題沒有做基線二分，不知道是否原本就存在** |
+
+**SPI1 問題的證據（實機，UART log）**
+
+- App 內 `slot_status()` 每次開機都是 `Nor(IoError)`；Bootloader 剛寫過 journal 時，連 App 自己的 4 byte JEDEC 讀取也在傳輸中途卡住（`CSTART=1`、`CTSIZE=2`、`TXP=1`、`RXP` 始終沒有）。
+- 同一次開機，每種組合讀 8 次 JEDEC ID，SCK 20 MHz：
+
+| 組合 | 單筆 4 byte | 指令＋資料兩筆（`NorFlash::read` 的型態，CS 保持拉低） |
+|---|---|---|
+| `init_spi1()`（SPE 關再開） | 8/8 | **1/8** |
+| ＋額外切換 SPE | 8/8 | **1/8** |
+| ＋延遲 100µs | — | **1/8** |
+| **先 RCC reset SPI1 再 `init_spi1()`** | 8/8 | **8/8** |
+
+- **結論**：SPI1 用過之後，只清 SPE 不夠，RCC reset 才能回到可用狀態。**殘留的是什麼狀態不知道**，只知道這個順序有效（reset 要在 GPIO alternate function 設定之前，這是量測過的順序）。
+- **逐一排除**（每項都有一次沒有改變失敗的實機 log）：interrupt 開／關（0/8 兩種）；SPI 時鐘（kernel clock 與 SCK 都改了，失敗逐位元相同）；SPI1 EOT 後等待 ≥ 1 SCK 週期（對應 ES0396 "Master data transfer stall"，log 逐位元相同，已移除）；跳轉前後 CS 狀態（PA4 維持高電位，不需要 pull）。
+- **附帶發現**：`init_clocks()` 沒有設定 PLL1_Q，SPI1/2/3 的 kernel clock 預設取自 PLL1_Q，RM0433 限制 200MHz；板子驗證過的 C 版 Bootloader（`KunYi/STM32H750NetLite` `a8c2d21`、`e3be0a3`）用 PLLQ=5（160MHz）。現在明確設為 160MHz 並加編譯期檢查；SCK 為 80MHz，與 C 版一致。「reset 值為 ÷2（400MHz）」是從 RM 推論，沒有量測；`PLL1DIVR=0x0104029F` 在修改後有讀回。**這一項沒有證明對修復是必要的**，保留是為了符合規格。
+
+**修復清單與驗證狀態**
+
+| 項目 | commit | host 測試 | 板上 |
 |---|---|---|---|
-| **H1** | **`m`（mark）指令把 journal 版本寫死為 `1.0.0+1`，且 `min_version = 0`、`revoke_mask = 0`，與實際上傳的 image 無關。兩個 slot 都被標成 Pending／Confirmed 且版本相同時，`decide()` 在「同狀態優先級、同版本」時偏好 slot A**（`both_confirmed_equal_versions_prefers_slot_a` 測試固定了這個行為） | `m` 的程式碼用固定的 `ImageVersion { 1, 0, 0, 1 }`；§1.4 原本就記錄「救援 `m` 寫死版本號」 | 上傳到 slot 1 後只對 slot 1 下 `m`，且上傳前確認 slot 0 的 journal 狀態；或新增 journal dump 指令觀察兩個 slot 的狀態與版本 |
-| **H2** | **`e` 只擦 slot 的第一個 64KB block**（`erase_block_64k(base)`）。若 image 大於 64KB，或 slot 先前寫過資料，**其餘部分沒有被擦除**；NOR 寫入是「只能 1→0」，舊資料與新資料 AND 後內容損毀，簽章驗證失敗 → 回退到 slot 0 | README 已記載此限制；`w` 沒有在寫入前擦除 | 上傳前用 host 工具確認整個 slot 已擦除（或在 rescue 中對每個 64KB block 都下 `e`）；比較上傳後從 NOR 讀回的內容與 image |
-| **H3** | **重構引入的回歸**（slot 偏移、`Layout`、時鐘、CS 處理）。**可能性較低**：golden 測試固定了偏移（slot 0 = `0x10000`、slot 1 = `0xB0000`），`rescue` 的 slot 選擇與原本等價（`usize::from(slot != b'0')`），且一般開機與跳轉已實機驗證 | `bootloader-h750` 在 P0～P1 的改動 | **二分**：在同一塊板子上，對 `10ba7bc`（或你打的基線 tag）、P0 後、P1 後各做一次完全相同的「上傳 slot 1 → mark → reboot」程序，比較行為 |
+| SPI1：`init_spi1()` 開頭 RCC reset、`jump_to_app` 對 SPI1 reset、PLL1_Q=160MHz、SCK 80MHz；App 不再把失敗的 `slot_status` 當成「已 confirm」 | `979553c`（squash，含 `clock_plan_tests`） | ✅ | ✅ 見下 |
+| Testing 每次開機累計 trial 並啟動看門狗（`boot-core::trial_step`） | `d08c1b6` | ✅ 含多次開機序列與 3 個變異測試 | **只看到 Pending → Testing（1/3）與 confirm**；Testing → Testing（2/3、3/3、回退）**沒有板上紀錄** |
+| rescue：`boot-rescue`（slot 參數、`w` 範圍、整 slot 擦除）、`m` 驗證後用 header 版本標記 | `2ab8509` | ✅ 8 個測試、5 個變異 | ✅ `j` 顯示 `m` 寫入的是 image 自己的版本（`1.0.0+2`）；**`ERR_VERIFY`、`ERR_RANGE`、`ERR_SLOT`、>64KB 的擦除沒有板上紀錄** |
+| 上傳腳本印出 image 版本、`make upload SLOT=`、文件同步 | `9d6e903` | Python 3 個測試 | — |
+| 腳本在傳輸前警告超過 512KiB RAM 視窗 | `54b9a20` | Python 4 個測試 | — |
 
-**建議的排查步驟（下一個 task 的第一項工作）**
-1. 取得完整 UART log（含 Bootloader 開機訊息、rescue 的回應）與操作步驟（包含 `e`／`w`／`m` 的順序與參數）。
-2. **加診斷再改行為**：新增 rescue 指令 `j`（journal dump：兩個 slot 的 state／trial／version／min_version、active sector、next offset），並讓開機流程印出「選了哪個 slot、原因」。這是低風險的，可以先做。
-3. 依診斷結果驗證 H1／H2；若需要，做 H3 的二分。
-4. 修復方向（依根因）：`m` 改為**從 NOR 上該 slot 的 image header 讀取真實版本**，並先做完整驗證才標記 Pending（plan §5.6 本來就要求）；`e` 擦除整個 slot（P2 本來就要做）；必要時補上 `decide()` 在「兩個 slot 同為 Pending」時的行為與測試。
-5. 為修復補 host 測試（rescue 邏輯目前在 `main.rs` 內無法 host 測試；若要測試，需要先把它抽到 `boot-rescue` crate，這也是 P2／P3 的既定方向）。
+實機看到的序列（SCK 80MHz，最終程式碼）：boot 1 兩個 slot 為 A Confirmed `+1`／B Pending `+2` → `primary=1`、`Trial recorded: 1/3`、App `CONFIRMED`；boot 2 兩邊 Confirmed → `primary=1`（B 版本較新）。這也說明了：**版本不同時，原本的症狀就不會出現。**
+
+**Size（rustc 1.91.1，同環境）**：Bootloader `text` 38,200（E.1 開始前）→ SPI 修復 38,548 → trial 38,520 → rescue 38,988；App 3,116 → 3,396。
+
+**後續參考（不是待辦，是備忘）**
+
+- **`decide()` 同狀態同版本的規則**：**決策為維持現狀（偏好 slot A）**。實機 log 已確認這個行為：boot 1 選 Pending 的 B，confirm 後 boot 2 兩邊同為 Confirmed，版本相同時會回到 A，版本不同時較新者勝出。若將來要改，有三個選項：
+  - **a. 維持（現狀）**：簡單、行為可預測；代價是「同版本重傳」只會在 Pending 階段被啟動一次。要讓新傳的 slot 持續勝出，必須簽成更高的版本。
+  - **b. 偏好「最近一次 Confirm 的 slot」**：符合「剛上傳的就是我要跑的」。journal 的 `seq` 已有順序資訊，但 `SlotJournalState` 目前不帶「上次 Confirm 的 seq」，需要新增欄位與 golden 測試。
+  - **c. 版本較新者優先，同版本再用 b 決勝**：最符合直覺，成本與 b 相同。
+  改動時要同步改 `both_confirmed_equal_versions_prefers_slot_a`，並注意 F429 bank swap 上「Confirmed 順序」與「目前映射的 bank」的關係（§5.2）。
+- **`xtask sign` 預設 `1.0.0+1`**：Makefile 與文件沒有提醒；之後可考慮讓 `make sign` 預設帶 build 計數，或在 `xtask sign` 印出版本。
+- **SPI1 殘留狀態的機制**：未識別。若要查，下一步是在失敗時讀 `SR`／`CR2`／`CTSIZE` 並對照 RM0433 的 SPI 章節與 errata；目前沒有需求（RCC reset 已足夠且有實機證據）。
+- **rescue 協議沒有版本查詢**：Host 無法分辨舊 Bootloader 與已修的 Bootloader，`rescue_upload.py` 只能把任何非 `OK` 的回應當成失敗。P2 重寫協議時應加入（例如 `i` 回報協議版本）。
