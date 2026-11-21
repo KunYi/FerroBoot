@@ -11,6 +11,11 @@ extern crate std;
 
 use boot_abi::IoOps;
 use boot_crc::Hasher;
+// `Flash` itself is deliberately not imported: the drivers implement both `NorFlash` and
+// `Flash`, which share method names (`read`), so having both traits in scope makes
+// `nor.read(..)` ambiguous. The impls below name it by its full path.
+use boot_flash::FlashError;
+use core::ops::Range;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// SPI NOR geometry (BY25Q32ES and compatible). These describe the *chip*, not the board.
@@ -19,6 +24,8 @@ pub const NOR_PAGE_SIZE: u32 = 256;
 pub const NOR_SECTOR_SIZE: u32 = 4096;
 /// 64 KiB block erase unit.
 pub const NOR_BLOCK_SIZE: u32 = 65536;
+/// Capacity of the supported chips (BY25Q32ES, W25Q32JV: 32 Mbit = 4 MiB).
+pub const NOR_CAPACITY: u32 = 4 * 1024 * 1024;
 
 pub const CMD_WRITE_ENABLE: u8 = 0x06;
 pub const CMD_WRITE_DISABLE: u8 = 0x04;
@@ -558,6 +565,152 @@ impl SecureRegion for RamNor {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// `boot_flash::Flash` for the SPI NOR drivers.
+//
+// `NorFlash` stays as the chip-level interface (JEDEC ID, status registers, 4 KiB / 64 KiB
+// erase commands); `Flash` is the view the journal, updater and rescue code use. The
+// drivers keep their behaviour; what `Flash` adds is the range checking the raw drivers
+// never had (an address past 4 MiB silently wraps on the chip), and rejected calls touch
+// nothing, not even the SPI bus.
+// ---------------------------------------------------------------------------------------
+
+impl From<NorError> for FlashError {
+    /// `Locked` (a security register) and `Corrupted` (a seed record) have no `Flash`
+    /// counterpart: `Flash` never touches security registers. They map to the nearest
+    /// meaning so a stray one is not mistaken for success.
+    fn from(e: NorError) -> Self {
+        match e {
+            NorError::IoError => FlashError::IoError,
+            NorError::NoTransport => FlashError::NoTransport,
+            NorError::Timeout => FlashError::Timeout,
+            NorError::Protected => FlashError::Protected,
+            NorError::InvalidAddress => FlashError::OutOfRange,
+            NorError::Unaligned => FlashError::Unaligned,
+            NorError::Locked => FlashError::Protected,
+            NorError::Corrupted => FlashError::IoError,
+            NorError::PowerCutSimulated => FlashError::PowerCut,
+        }
+    }
+}
+
+/// The 4 KiB sector containing `off` on a chip of `cap` bytes; empty past the end.
+fn nor_unit_at(off: u32, cap: u32) -> Range<u32> {
+    if off >= cap {
+        return cap..cap;
+    }
+    let start = off & !(NOR_SECTOR_SIZE - 1);
+    start..(start + NOR_SECTOR_SIZE).min(cap)
+}
+
+/// `Err(OutOfRange)` unless `off..off + len` fits in `cap` bytes.
+fn nor_check_range(off: u32, len: usize, cap: u32) -> Result<(), FlashError> {
+    if u64::from(off) + len as u64 > u64::from(cap) {
+        Err(FlashError::OutOfRange)
+    } else {
+        Ok(())
+    }
+}
+
+/// `Flash::erase_span` for a chip with 4 KiB sectors and 64 KiB blocks: a whole block when
+/// `off` starts one and `limit` leaves room for all of it, otherwise one sector.
+fn nor_erase_span<N: NorFlash>(
+    nor: &mut N,
+    off: u32,
+    limit: u32,
+    cap: u32,
+) -> Result<Range<u32>, FlashError> {
+    let unit = nor_unit_at(off, cap);
+    if unit.is_empty() {
+        return Err(FlashError::OutOfRange);
+    }
+    if unit.start != off || unit.end > limit {
+        return Err(FlashError::Unaligned);
+    }
+    // `limit >= unit.end > off`, so the subtraction cannot underflow.
+    if off % NOR_BLOCK_SIZE == 0 && limit - off >= NOR_BLOCK_SIZE && off + NOR_BLOCK_SIZE <= cap {
+        nor.erase_block_64k(off)?;
+        return Ok(off..off + NOR_BLOCK_SIZE);
+    }
+    nor.erase_sector_4k(off)?;
+    Ok(unit)
+}
+
+impl<'a> boot_flash::Flash for SpiNorIoOpsDriver<'a> {
+    const PROGRAM_ALIGN: u32 = 1;
+
+    fn capacity(&self) -> u32 {
+        NOR_CAPACITY
+    }
+
+    fn read(&mut self, off: u32, buf: &mut [u8]) -> Result<(), FlashError> {
+        nor_check_range(off, buf.len(), NOR_CAPACITY)?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        Ok(NorFlash::read(self, off, buf)?)
+    }
+
+    fn program(&mut self, off: u32, data: &[u8]) -> Result<(), FlashError> {
+        nor_check_range(off, data.len(), NOR_CAPACITY)?;
+        Ok(NorFlash::write(self, off, data)?)
+    }
+
+    fn unit_at(&self, off: u32) -> Range<u32> {
+        nor_unit_at(off, NOR_CAPACITY)
+    }
+
+    fn erase_unit(&mut self, off: u32) -> Result<(), FlashError> {
+        let unit = nor_unit_at(off, NOR_CAPACITY);
+        if unit.is_empty() {
+            return Err(FlashError::OutOfRange);
+        }
+        Ok(NorFlash::erase_sector_4k(self, unit.start)?)
+    }
+
+    fn erase_span(&mut self, off: u32, limit: u32) -> Result<Range<u32>, FlashError> {
+        nor_erase_span(self, off, limit, NOR_CAPACITY)
+    }
+}
+
+#[cfg(feature = "std")]
+impl boot_flash::Flash for RamNor {
+    const PROGRAM_ALIGN: u32 = 1;
+
+    fn capacity(&self) -> u32 {
+        self.mem.len() as u32
+    }
+
+    fn read(&mut self, off: u32, buf: &mut [u8]) -> Result<(), FlashError> {
+        nor_check_range(off, buf.len(), self.mem.len() as u32)?;
+        Ok(NorFlash::read(self, off, buf)?)
+    }
+
+    fn program(&mut self, off: u32, data: &[u8]) -> Result<(), FlashError> {
+        // `RamNor::write` checks the bound one byte at a time, so a write that runs off the
+        // end would already have changed the bytes before it. Reject it up front.
+        nor_check_range(off, data.len(), self.mem.len() as u32)?;
+        Ok(NorFlash::write(self, off, data)?)
+    }
+
+    fn unit_at(&self, off: u32) -> Range<u32> {
+        nor_unit_at(off, self.mem.len() as u32)
+    }
+
+    fn erase_unit(&mut self, off: u32) -> Result<(), FlashError> {
+        let unit = nor_unit_at(off, self.mem.len() as u32);
+        if unit.is_empty() {
+            return Err(FlashError::OutOfRange);
+        }
+        Ok(NorFlash::erase_sector_4k(self, unit.start)?)
+    }
+
+    fn erase_span(&mut self, off: u32, limit: u32) -> Result<Range<u32>, FlashError> {
+        let cap = self.mem.len() as u32;
+        nor_erase_span(self, off, limit, cap)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,5 +979,527 @@ mod tests {
         let big = [0u8; 257];
         assert_eq!(nor.program_security_register(1, 0, &big), Err(NorError::InvalidAddress));
         assert_eq!(CS_LOG.with(|c| c.borrow().0), 0);
+    }
+}
+
+/// Tests for the `boot_flash::Flash` impls. Kept out of `mod tests` on purpose: this module
+/// imports `Flash` but not `NorFlash` (see the note at the top of the file), so `nor.read()`
+/// means `Flash::read` here.
+#[cfg(test)]
+mod flash_impl_tests {
+    extern crate std;
+
+    use super::{
+        NorError, RamNor, SpiNorIoOpsDriver, CMD_BLOCK_ERASE_64K, CMD_FAST_READ, CMD_PAGE_PROGRAM,
+        CMD_SECTOR_ERASE_4K, NOR_CAPACITY,
+    };
+    use boot_abi::IoOps;
+    use boot_flash::{Flash, FlashError, RamFlash, UNIFORM_4K_4MB};
+    use core::cell::RefCell;
+    use core::ops::Range;
+    use std::thread_local;
+    use std::vec;
+    use std::vec::Vec;
+
+    // --- A SPI transport that records every chip-select frame --------------------------
+
+    /// One chip-select frame: the first byte sent, the 3-byte address that follows it (if
+    /// any), and the total bytes clocked.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Frame {
+        cmd: u8,
+        addr: u32,
+        bytes: usize,
+    }
+
+    #[derive(Default)]
+    struct Bus {
+        frames: Vec<Frame>,
+        first: bool,
+        asserts: u32,
+    }
+
+    thread_local! {
+        static BUS: RefCell<Bus> = RefCell::new(Bus::default());
+    }
+
+    unsafe extern "C" fn rec_cs(assert: bool) {
+        BUS.with(|b| {
+            let mut b = b.borrow_mut();
+            if assert {
+                b.asserts += 1;
+                b.first = true;
+                b.frames.push(Frame {
+                    cmd: 0,
+                    addr: 0,
+                    bytes: 0,
+                });
+            }
+        });
+    }
+
+    unsafe extern "C" fn rec_spi(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
+        // all reads return zeros, so the status register never says "busy"
+        core::slice::from_raw_parts_mut(rx, len as usize).fill(0);
+        BUS.with(|b| {
+            let mut b = b.borrow_mut();
+            let first = b.first;
+            let f = b
+                .frames
+                .last_mut()
+                .expect("transfer outside a chip-select frame");
+            f.bytes += len as usize;
+            if first && !tx.is_null() {
+                let t = core::slice::from_raw_parts(tx, len as usize);
+                f.cmd = t[0];
+                if t.len() >= 4 {
+                    f.addr = u32::from(t[1]) << 16 | u32::from(t[2]) << 8 | u32::from(t[3]);
+                }
+            }
+            b.first = false;
+        });
+        0
+    }
+
+    unsafe extern "C" fn rec_millis() -> u32 {
+        0
+    }
+
+    unsafe extern "C" fn rec_yield() {}
+
+    static REC_IO: IoOps = IoOps {
+        spi_transfer: Some(rec_spi),
+        cs: Some(rec_cs),
+        millis: rec_millis,
+        yield_: rec_yield,
+        reserved: [0; 4],
+    };
+
+    static NO_TRANSPORT_IO: IoOps = IoOps {
+        spi_transfer: None,
+        cs: None,
+        millis: rec_millis,
+        yield_: rec_yield,
+        reserved: [0; 4],
+    };
+
+    fn fresh_bus() {
+        BUS.with(|b| *b.borrow_mut() = Bus::default());
+    }
+
+    /// The data-moving frames, without the status polls and write-enables around them.
+    fn ops() -> Vec<Frame> {
+        const READ: u8 = CMD_FAST_READ;
+        BUS.with(|b| {
+            b.borrow()
+                .frames
+                .iter()
+                .copied()
+                .filter(|f| {
+                    matches!(
+                        f.cmd,
+                        CMD_PAGE_PROGRAM | CMD_SECTOR_ERASE_4K | CMD_BLOCK_ERASE_64K | READ
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn bus_untouched() -> bool {
+        BUS.with(|b| b.borrow().asserts == 0)
+    }
+
+    // --- SpiNorIoOpsDriver ------------------------------------------------------------
+
+    #[test]
+    fn spi_capacity_and_units() {
+        let nor = SpiNorIoOpsDriver::new(&REC_IO);
+        assert_eq!(nor.capacity(), 4 * 1024 * 1024);
+        assert_eq!(nor.capacity(), NOR_CAPACITY);
+        assert_eq!(<SpiNorIoOpsDriver as Flash>::PROGRAM_ALIGN, 1);
+        assert_eq!(nor.unit_at(0), 0..0x1000);
+        assert_eq!(nor.unit_at(0xFFF), 0..0x1000);
+        assert_eq!(nor.unit_at(0x1000), 0x1000..0x2000);
+        assert_eq!(nor.unit_at(0x3F_FFFF), 0x3F_F000..0x40_0000);
+        assert!(nor.unit_at(0x40_0000).is_empty());
+        assert!(nor.unit_at(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn spi_program_is_split_at_256_byte_pages() {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        // 300 bytes from 0x1F0: 16 bytes to the end of that page, one whole page, then 28.
+        nor.program(0x1F0, &[0xAB; 300]).unwrap();
+        assert_eq!(
+            ops(),
+            vec![
+                Frame {
+                    cmd: CMD_PAGE_PROGRAM,
+                    addr: 0x1F0,
+                    bytes: 4 + 16
+                },
+                Frame {
+                    cmd: CMD_PAGE_PROGRAM,
+                    addr: 0x200,
+                    bytes: 4 + 256
+                },
+                Frame {
+                    cmd: CMD_PAGE_PROGRAM,
+                    addr: 0x300,
+                    bytes: 4 + 28
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spi_read_sends_fast_read_with_the_address() {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        let mut buf = [0u8; 32];
+        nor.read(0x12_3456, &mut buf).unwrap();
+        assert_eq!(
+            ops(),
+            vec![Frame {
+                cmd: CMD_FAST_READ,
+                addr: 0x12_3456,
+                bytes: 5 + 32
+            }]
+        );
+    }
+
+    #[test]
+    fn spi_erase_unit_erases_the_sector_that_contains_the_offset() {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        nor.erase_unit(0x3456).unwrap();
+        nor.erase_unit(0x3000).unwrap();
+        nor.erase_unit(0x3FFF).unwrap();
+        let sector = Frame {
+            cmd: CMD_SECTOR_ERASE_4K,
+            addr: 0x3000,
+            bytes: 4,
+        };
+        assert_eq!(ops(), vec![sector, sector, sector]);
+    }
+
+    #[test]
+    fn spi_rejected_calls_do_not_touch_the_bus() {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        let cap = nor.capacity();
+        let mut b8 = [0u8; 8];
+        assert_eq!(nor.read(cap - 4, &mut b8), Err(FlashError::OutOfRange));
+        assert_eq!(nor.read(cap, &mut b8), Err(FlashError::OutOfRange));
+        assert_eq!(nor.read(u32::MAX, &mut b8), Err(FlashError::OutOfRange));
+        assert_eq!(nor.program(cap - 4, &[0; 8]), Err(FlashError::OutOfRange));
+        assert_eq!(nor.program(cap, &[0]), Err(FlashError::OutOfRange));
+        assert_eq!(nor.erase_unit(cap), Err(FlashError::OutOfRange));
+        assert_eq!(nor.erase_span(cap, cap), Err(FlashError::OutOfRange));
+        assert_eq!(nor.erase_span(0x1001, 0x4_0000), Err(FlashError::Unaligned));
+        assert_eq!(nor.erase_span(0x1000, 0x1FFF), Err(FlashError::Unaligned));
+        assert!(bus_untouched(), "a rejected call must not select the chip");
+    }
+
+    #[test]
+    fn spi_empty_read_and_program_are_free() {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        nor.read(0x100, &mut []).unwrap();
+        nor.program(0x100, &[]).unwrap();
+        nor.read(nor.capacity(), &mut []).unwrap(); // empty, ends exactly at the end
+        assert!(bus_untouched());
+        assert_eq!(
+            nor.read(nor.capacity() + 1, &mut []),
+            Err(FlashError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn spi_the_last_bytes_of_the_chip_are_reachable() {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        let cap = nor.capacity();
+        nor.program(cap - 16, &[0; 16]).unwrap();
+        assert_eq!(
+            ops(),
+            vec![Frame {
+                cmd: CMD_PAGE_PROGRAM,
+                addr: cap - 16,
+                bytes: 4 + 16
+            }]
+        );
+    }
+
+    #[test]
+    fn spi_span_uses_a_block_only_when_aligned_and_there_is_room() {
+        let sector = |addr| Frame {
+            cmd: CMD_SECTOR_ERASE_4K,
+            addr,
+            bytes: 4,
+        };
+        let block = |addr| Frame {
+            cmd: CMD_BLOCK_ERASE_64K,
+            addr,
+            bytes: 4,
+        };
+        // (off, limit, expected frame, expected range)
+        let cases: [(u32, u32, Frame, Range<u32>); 5] = [
+            (0x2_0000, 0x4_0000, block(0x2_0000), 0x2_0000..0x3_0000),
+            (0x2_0000, 0x3_0000, block(0x2_0000), 0x2_0000..0x3_0000), // limit == block end
+            (0x2_0000, 0x2_F000, sector(0x2_0000), 0x2_0000..0x2_1000), // 4 KiB short
+            (0x2_1000, 0x4_0000, sector(0x2_1000), 0x2_1000..0x2_2000), // sector, not block, aligned
+            (0x3F_0000, 0x40_0000, block(0x3F_0000), 0x3F_0000..0x40_0000), // last block
+        ];
+        for (off, limit, frame, range) in cases {
+            fresh_bus();
+            let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+            assert_eq!(
+                nor.erase_span(off, limit),
+                Ok(range),
+                "span {off:#x}..{limit:#x}"
+            );
+            assert_eq!(ops(), vec![frame], "span {off:#x}..{limit:#x}");
+        }
+    }
+
+    /// Clears `start..end` by looping on `erase_span` and returns the frames sent.
+    fn clear_spi(start: u32, end: u32) -> Vec<Frame> {
+        fresh_bus();
+        let mut nor = SpiNorIoOpsDriver::new(&REC_IO);
+        let mut at = start;
+        while at < end {
+            at = nor.erase_span(at, end).unwrap().end;
+        }
+        assert_eq!(at, end);
+        ops()
+    }
+
+    #[test]
+    fn spi_clearing_a_640k_slot_takes_ten_block_erases_like_the_rescue_e_command() {
+        let frames = clear_spi(0x10_0000, 0x10_0000 + 640 * 1024);
+        let expected: Vec<Frame> = (0..10)
+            .map(|i| Frame {
+                cmd: CMD_BLOCK_ERASE_64K,
+                addr: 0x10_0000 + i * 0x1_0000,
+                bytes: 4,
+            })
+            .collect();
+        assert_eq!(frames, expected);
+    }
+
+    #[test]
+    fn spi_clearing_a_range_that_starts_off_a_block_edge_uses_sectors_then_blocks() {
+        // 0x1_1000..0x3_0000: fifteen sectors up to the 0x2_0000 block edge, then one block.
+        let frames = clear_spi(0x1_1000, 0x3_0000);
+        let mut expected: Vec<Frame> = (0..15)
+            .map(|i| Frame {
+                cmd: CMD_SECTOR_ERASE_4K,
+                addr: 0x1_1000 + i * 0x1000,
+                bytes: 4,
+            })
+            .collect();
+        expected.push(Frame {
+            cmd: CMD_BLOCK_ERASE_64K,
+            addr: 0x2_0000,
+            bytes: 4,
+        });
+        assert_eq!(frames.len(), 16);
+        assert_eq!(frames, expected);
+        // and a range ending mid-block goes back to sectors for the tail
+        let tail = clear_spi(0x2_0000, 0x3_3000);
+        assert_eq!(
+            tail,
+            vec![
+                Frame {
+                    cmd: CMD_BLOCK_ERASE_64K,
+                    addr: 0x2_0000,
+                    bytes: 4
+                },
+                Frame {
+                    cmd: CMD_SECTOR_ERASE_4K,
+                    addr: 0x3_0000,
+                    bytes: 4
+                },
+                Frame {
+                    cmd: CMD_SECTOR_ERASE_4K,
+                    addr: 0x3_1000,
+                    bytes: 4
+                },
+                Frame {
+                    cmd: CMD_SECTOR_ERASE_4K,
+                    addr: 0x3_2000,
+                    bytes: 4
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spi_without_a_transport_the_errors_are_flash_errors() {
+        let mut nor = SpiNorIoOpsDriver::new(&NO_TRANSPORT_IO);
+        let mut b = [0u8; 4];
+        assert_eq!(nor.read(0, &mut b), Err(FlashError::NoTransport));
+        assert_eq!(nor.program(0, &[1]), Err(FlashError::NoTransport));
+        assert_eq!(nor.erase_unit(0), Err(FlashError::NoTransport));
+        assert_eq!(nor.erase_span(0, 0x1_0000), Err(FlashError::NoTransport));
+    }
+
+    #[test]
+    fn nor_errors_map_to_flash_errors() {
+        // Written out by hand: a new NorError variant also breaks the exhaustive `match`
+        // in `From`, so this table cannot silently fall behind.
+        let table = [
+            (NorError::IoError, FlashError::IoError),
+            (NorError::NoTransport, FlashError::NoTransport),
+            (NorError::Timeout, FlashError::Timeout),
+            (NorError::Protected, FlashError::Protected),
+            (NorError::InvalidAddress, FlashError::OutOfRange),
+            (NorError::Unaligned, FlashError::Unaligned),
+            (NorError::Locked, FlashError::Protected),
+            (NorError::Corrupted, FlashError::IoError),
+            (NorError::PowerCutSimulated, FlashError::PowerCut),
+        ];
+        for (n, f) in table {
+            assert_eq!(FlashError::from(n), f, "{n:?}");
+        }
+    }
+
+    // --- RamNor against RamFlash: two independent simulators as each other's oracle ---------
+
+    /// Small deterministic PRNG (xorshift64*), so the sequences are reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            (self.next() >> 33) as u32 % n
+        }
+    }
+
+    fn clear_range<F: Flash>(f: &mut F, start: u32, end: u32) -> Vec<Range<u32>> {
+        let mut spans = Vec::new();
+        let mut at = start;
+        while at < end {
+            let r = f.erase_span(at, end).unwrap();
+            at = r.end;
+            spans.push(r);
+        }
+        spans
+    }
+
+    #[test]
+    fn ramnor_and_ramflash_agree_on_every_operation() {
+        let mut nor = RamNor::new(4 * 1024 * 1024);
+        let mut reference = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        // Work inside 512 KiB so programs and erases keep colliding, plus a few probes at the
+        // far end of the device.
+        for step in 0..3000u32 {
+            let near_end = rng.below(20) == 0;
+            let base = if near_end { 4 * 1024 * 1024 - 8192 } else { 0 };
+            let span = if near_end { 8192 } else { 512 * 1024 };
+            let off = base + rng.below(span);
+            match rng.below(4) {
+                0 | 1 => {
+                    let len = rng.below(700) as usize;
+                    let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                    assert_eq!(
+                        nor.program(off, &data),
+                        reference.program(off, &data),
+                        "program #{step} at {off:#x} len {len}"
+                    );
+                }
+                2 => assert_eq!(
+                    nor.erase_unit(off),
+                    reference.erase_unit(off),
+                    "erase #{step} at {off:#x}"
+                ),
+                _ => {
+                    let len = rng.below(300) as usize;
+                    let (mut a, mut b) = (vec![0u8; len], vec![0u8; len]);
+                    assert_eq!(nor.read(off, &mut a), reference.read(off, &mut b));
+                    assert_eq!(a, b, "read #{step}");
+                }
+            }
+        }
+        assert!(nor.mem == reference.bytes(), "final contents differ");
+    }
+
+    #[test]
+    fn ramnor_and_ramflash_agree_on_what_clearing_a_range_does() {
+        for (start, end) in [
+            (0x1_0000, 0x1_0000 + 640 * 1024),
+            (0x1_1000, 0x3_0000),
+            (0x2_0000, 0x3_3000),
+            (0, 4 * 1024 * 1024),
+        ] {
+            let mut nor = RamNor::new(4 * 1024 * 1024);
+            let mut reference = RamFlash::<1>::new(UNIFORM_4K_4MB);
+            nor.mem.fill(0x5A);
+            reference.bytes_mut().fill(0x5A);
+            let nor_spans = clear_range(&mut nor, start, end);
+            let ref_spans = clear_range(&mut reference, start, end);
+            assert!(nor.mem == reference.bytes(), "{start:#x}..{end:#x}");
+            for (i, &b) in nor.mem.iter().enumerate() {
+                let inside = (start as usize..end as usize).contains(&i);
+                assert_eq!(b, if inside { 0xFF } else { 0x5A }, "byte {i:#x}");
+            }
+            // The reference (default span) always erases one 4 KiB unit; RamNor coalesces
+            // into blocks where it can, so it needs fewer calls and never more.
+            assert!(ref_spans.iter().all(|r| r.end - r.start == 4096));
+            assert!(nor_spans.len() <= ref_spans.len());
+            assert!(nor_spans.iter().any(|r| r.end - r.start == 65536));
+        }
+    }
+
+    #[test]
+    fn ramnor_power_cut_matches_ramflash_clean_cut() {
+        for cut in 0..48u64 {
+            let mut nor = RamNor::new(4 * 1024 * 1024);
+            nor.fail_after_bytes = Some(cut as usize);
+            let mut reference = RamFlash::<1>::new(UNIFORM_4K_4MB);
+            reference.arm_power_cut(cut, boot_flash::CutMode::Clean);
+            let data: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(7)).collect();
+            let a = nor.program(0x100, &data);
+            let b = reference.program(0x100, &data);
+            assert_eq!(a, b, "cut after {cut} bytes");
+            assert!(nor.mem == reference.bytes(), "cut after {cut} bytes");
+            assert_eq!(a.is_err(), cut < 40);
+        }
+    }
+
+    #[test]
+    fn ramnor_program_past_the_end_changes_nothing() {
+        let mut nor = RamNor::new(8192);
+        // `RamNor::write` alone would program the first 2 bytes before failing on the 3rd.
+        assert_eq!(
+            nor.program(8190, &[0, 0, 0, 0]),
+            Err(FlashError::OutOfRange)
+        );
+        assert!(nor.mem.iter().all(|&b| b == 0xFF));
+        let mut b = [0u8; 4];
+        assert_eq!(nor.read(8190, &mut b), Err(FlashError::OutOfRange));
+        assert_eq!(nor.erase_unit(8192), Err(FlashError::OutOfRange));
+        assert_eq!(nor.erase_span(8192, 8192), Err(FlashError::OutOfRange));
+        assert_eq!(nor.capacity(), 8192);
+    }
+
+    #[test]
+    fn ramnor_span_never_runs_a_block_past_the_end() {
+        // 72 KiB: the block at 0x1_0000 would end at 0x2_0000, beyond the device, even though
+        // the caller's limit leaves room for it. It must fall back to a sector.
+        let mut nor = RamNor::new(0x1_2000);
+        nor.mem.fill(0);
+        assert_eq!(nor.erase_span(0x1_0000, 0x2_0000), Ok(0x1_0000..0x1_1000));
+        assert!(nor.mem[0x1_0000..0x1_1000].iter().all(|&b| b == 0xFF));
+        assert!(nor.mem[0x1_1000..].iter().all(|&b| b == 0));
+        // the 64 KiB block that does fit is still used
+        assert_eq!(nor.erase_span(0, 0x1_0000), Ok(0..0x1_0000));
     }
 }

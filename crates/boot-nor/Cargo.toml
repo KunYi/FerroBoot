@@ -10,7 +10,9 @@ std = []
 
 [dependencies]
 boot-abi = { workspace = true }
+boot-flash = { workspace = true }
 boot-crc = { workspace = true }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
+boot-flash = { workspace = true, features = ["std"] }

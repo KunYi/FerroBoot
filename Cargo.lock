@@ -228,6 +228,7 @@ version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-crc",
+ "boot-flash",
  "zerocopy",
 ]
 
