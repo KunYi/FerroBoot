@@ -191,6 +191,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-flash"
+version = "0.1.0"
+
+[[package]]
 name = "boot-image"
 version = "0.2.0"
 dependencies = [

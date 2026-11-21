@@ -7,6 +7,7 @@ members = [
     "crates/boot-crc",
     "crates/boot-layout",
     "crates/boot-time",
+    "crates/boot-flash",
     "crates/boot-nor",
     "crates/boot-journal",
     "crates/boot-core",
@@ -61,6 +62,7 @@ boot-crypto = { path = "crates/boot-crypto" }
 boot-crc = { path = "crates/boot-crc" }
 boot-layout = { path = "crates/boot-layout" }
 boot-time = { path = "crates/boot-time" }
+boot-flash = { path = "crates/boot-flash" }
 boot-nor = { path = "crates/boot-nor" }
 boot-journal = { path = "crates/boot-journal" }
 boot-core = { path = "crates/boot-core" }

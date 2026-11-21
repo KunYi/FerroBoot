@@ -1,0 +1,15 @@
+[package]
+name = "boot-flash"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Flash abstraction (uneven erase units, program alignment) and a host RamFlash simulator, for FerroBoot"
+
+[features]
+default = []
+# Enables the host-side RamFlash simulator (needs `std`). Never part of a firmware build.
+std = []
+
+[dependencies]
+
+[dev-dependencies]
