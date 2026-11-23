@@ -6,14 +6,15 @@ license.workspace = true
 
 [features]
 default = []
-std = ["boot-nor/std"]
+std = ["boot-flash/std"]
 
 [dependencies]
 boot-abi = { workspace = true }
 boot-layout = { workspace = true }
-boot-nor = { workspace = true }
+boot-flash = { workspace = true }
 boot-crc = { workspace = true }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
 boot-nor = { workspace = true, features = ["std"] }
+boot-flash = { workspace = true, features = ["std"] }

@@ -210,6 +210,7 @@ version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-crc",
+ "boot-flash",
  "boot-layout",
  "boot-nor",
  "zerocopy",
@@ -262,6 +263,7 @@ dependencies = [
  "boot-abi",
  "boot-core",
  "boot-crypto",
+ "boot-flash",
  "boot-image",
  "boot-journal",
  "boot-layout",
@@ -277,6 +279,7 @@ dependencies = [
  "boot-abi",
  "boot-core",
  "boot-crypto",
+ "boot-flash",
  "boot-image",
  "boot-journal",
  "boot-layout",

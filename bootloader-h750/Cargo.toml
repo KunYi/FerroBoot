@@ -23,6 +23,7 @@ boot-image = { workspace = true }
 boot-layout = { workspace = true }
 boot-crypto = { workspace = true }
 boot-nor = { workspace = true }
+boot-flash = { workspace = true }
 boot-journal = { workspace = true }
 boot-core = { workspace = true }
 boot-rescue = { workspace = true }

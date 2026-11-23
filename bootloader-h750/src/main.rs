@@ -12,7 +12,8 @@ use boot_rescue::{drain_len, parse_slot, slot_erase_blocks, write_address};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
 use boot_journal::{JournalError, JournalManager, SlotJournalState};
 use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
-use boot_nor::{NorError, NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
+use boot_flash::FlashError;
+use boot_nor::{NorFlash, SpiNorIoOpsDriver, NOR_SECTOR_SIZE};
 use boot_stm32h7::{
     uart_write_u32, init_clocks, init_gpio_ui, init_nor_cs, init_poll_millis, init_spi1, init_sram4_ecc,
     init_usart1, is_key2_pressed, jump_to_app, poll_millis, read_mcu_uid, set_led, set_nor_cs,
@@ -213,10 +214,11 @@ unsafe extern "C" fn abi_slot_status(slot: u8, out: *mut SlotInfo) -> i32 {
 
 fn journal_err_name(e: &JournalError) -> &'static str {
     match e {
-        JournalError::Nor(NorError::IoError) => "Nor(IoError)",
-        JournalError::Nor(NorError::NoTransport) => "Nor(NoTransport)",
-        JournalError::Nor(NorError::Timeout) => "Nor(Timeout)",
-        JournalError::Nor(_) => "Nor(other)",
+        // The strings keep their old "Nor(...)" spelling so logs stay comparable across builds.
+        JournalError::Flash(FlashError::IoError) => "Nor(IoError)",
+        JournalError::Flash(FlashError::NoTransport) => "Nor(NoTransport)",
+        JournalError::Flash(FlashError::Timeout) => "Nor(Timeout)",
+        JournalError::Flash(_) => "Nor(other)",
         JournalError::Corrupted => "Corrupted",
         JournalError::NoValidSector => "NoValidSector",
         JournalError::InvalidSlot => "InvalidSlot",

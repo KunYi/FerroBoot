@@ -1,14 +1,15 @@
-//! NOR Flash Ping-Pong State Journal
+//! Flash Ping-Pong State Journal
 //!
-//! Stores firmware slot state transitions across two 4KB ping-pong sectors
-//! with power-cut tolerance and snapshot rollover.
+//! Stores firmware slot state transitions across two ping-pong sectors, each exactly one
+//! erase unit of the flash device (4 KiB on the H750's SPI NOR), with power-cut tolerance
+//! and snapshot rollover.
 
 #![no_std]
 
 use boot_abi::{ImageVersion, SLOT_STATE_EMPTY};
-use boot_layout::Layout;
-use boot_nor::{NorError, NorFlash, NOR_SECTOR_SIZE};
 use boot_crc::Hasher;
+use boot_flash::{Flash, FlashError};
+use boot_layout::Layout;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const JOURNAL_SECTOR_MAGIC: u32 = 0x4A4E_524C; // 'JRNL'
@@ -22,21 +23,24 @@ pub const RECORD_KIND_BL_UPDATE_DONE: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalError {
-    Nor(NorError),
+    /// The flash device reported an error (in a simulator: lost power).
+    Flash(FlashError),
     Corrupted,
     NoValidSector,
     InvalidSlot,
-    /// The layout's journal regions are not 4 KiB erase units (the only unit supported today).
+    /// The layout does not fit this device: a journal region is not exactly one erase unit,
+    /// the two regions differ in size or are the same one, or the device's program word does
+    /// not divide the 16-byte header and 32-byte records.
     BadLayout,
 }
 
-impl From<NorError> for JournalError {
-    fn from(e: NorError) -> Self {
-        JournalError::Nor(e)
+impl From<FlashError> for JournalError {
+    fn from(e: FlashError) -> Self {
+        JournalError::Flash(e)
     }
 }
 
-/// Sector header stored at offset 0 of each 4KB journal sector.
+/// Sector header stored at offset 0 of each journal sector.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct JournalSectorHeader {
@@ -170,7 +174,7 @@ impl Default for SlotJournalState {
 }
 
 pub struct JournalManager {
-    /// The two ping-pong sector addresses, from `Layout::journal`.
+    /// The two ping-pong sector offsets, from `Layout::journal`.
     sectors: [u32; 2],
     /// Usable bytes per journal sector (`Layout::journal[..].len`).
     sector_len: u32,
@@ -182,21 +186,37 @@ pub struct JournalManager {
     pub slot_b: SlotJournalState,
 }
 
+/// True if `off..off + len` is exactly one erase unit of `flash`.
+fn is_one_erase_unit<F: Flash>(flash: &F, off: u32, len: u32) -> bool {
+    match off.checked_add(len) {
+        Some(end) => len > 0 && flash.unit_at(off) == (off..end),
+        None => false,
+    }
+}
+
 impl JournalManager {
     /// Loads or initializes the journal across the ping-pong sectors.
-    pub fn init<F: NorFlash>(nor: &mut F, layout: &Layout) -> Result<Self, JournalError> {
+    pub fn init<F: Flash>(flash: &mut F, layout: &Layout) -> Result<Self, JournalError> {
         let sectors = [layout.journal[0].offset, layout.journal[1].offset];
         let sector_len = layout.journal[0].len;
-        // Erase/rollover use 4 KiB sector erases; reject any layout that disagrees.
-        if layout.journal[1].len != sector_len || sector_len != NOR_SECTOR_SIZE {
+        // A journal sector is erased and rolled over as a whole, so each region must be exactly
+        // one erase unit of this device (whatever its size), the two must be the same size and
+        // different, and the program word must divide the header and record sizes.
+        if layout.journal[1].len != sector_len
+            || sectors[0] == sectors[1]
+            || !is_one_erase_unit(flash, sectors[0], sector_len)
+            || !is_one_erase_unit(flash, sectors[1], sector_len)
+            || 16 % F::PROGRAM_ALIGN != 0
+            || RECORD_SIZE as u32 % F::PROGRAM_ALIGN != 0
+        {
             return Err(JournalError::BadLayout);
         }
 
         let mut hdr0_buf = [0u8; 16];
         let mut hdr1_buf = [0u8; 16];
 
-        nor.read(sectors[0], &mut hdr0_buf)?;
-        nor.read(sectors[1], &mut hdr1_buf)?;
+        flash.read(sectors[0], &mut hdr0_buf)?;
+        flash.read(sectors[1], &mut hdr1_buf)?;
 
         let hdr0 = JournalSectorHeader::ref_from_prefix(&hdr0_buf).ok().map(|(h, _)| *h);
         let hdr1 = JournalSectorHeader::ref_from_prefix(&hdr1_buf).ok().map(|(h, _)| *h);
@@ -218,9 +238,9 @@ impl JournalManager {
             (false, true) => (sectors[1], hdr1.unwrap().generation),
             (false, false) => {
                 // Initialize clean journal on Sector 0
-                nor.erase_sector_4k(sectors[0])?;
+                flash.erase_unit(sectors[0])?;
                 let new_hdr = JournalSectorHeader::new(1);
-                nor.write(sectors[0], new_hdr.as_bytes())?;
+                flash.program(sectors[0], new_hdr.as_bytes())?;
                 (sectors[0], 1)
             }
         };
@@ -236,16 +256,16 @@ impl JournalManager {
             slot_b: SlotJournalState::default(),
         };
 
-        mgr.replay_active_sector(nor)?;
+        mgr.replay_active_sector(flash)?;
         Ok(mgr)
     }
 
-    fn replay_active_sector<F: NorFlash>(&mut self, nor: &mut F) -> Result<(), JournalError> {
+    fn replay_active_sector<F: Flash>(&mut self, flash: &mut F) -> Result<(), JournalError> {
         let mut buf = [0u8; RECORD_SIZE];
         let mut offset = 16u32;
 
         while offset + (RECORD_SIZE as u32) <= self.sector_len {
-            nor.read(self.active_sector_addr + offset, &mut buf)?;
+            flash.read(self.active_sector_addr + offset, &mut buf)?;
             let (rec_ref, _) = match JournalRecord::ref_from_prefix(&buf) {
                 Ok(r) => r,
                 Err(_) => break,
@@ -284,9 +304,9 @@ impl JournalManager {
     }
 
     /// Appends a new state record, triggering snapshot rollover if sector is full.
-    pub fn append_record<F: NorFlash>(
+    pub fn append_record<F: Flash>(
         &mut self,
-        nor: &mut F,
+        flash: &mut F,
         slot: u8,
         state: u8,
         trial: u8,
@@ -301,7 +321,7 @@ impl JournalManager {
 
         // Check if sector full
         if self.next_record_offset + (RECORD_SIZE as u32) > self.sector_len {
-            self.rollover(nor)?;
+            self.rollover(flash)?;
         }
 
         let record = JournalRecord::new(
@@ -316,7 +336,7 @@ impl JournalManager {
             key_revoke_mask,
         );
 
-        nor.write(
+        flash.program(
             self.active_sector_addr + self.next_record_offset,
             record.as_bytes(),
         )?;
@@ -341,18 +361,18 @@ impl JournalManager {
     }
 
     /// Compacts current state into the backup sector and erases old sector.
-    fn rollover<F: NorFlash>(&mut self, nor: &mut F) -> Result<(), JournalError> {
+    fn rollover<F: Flash>(&mut self, flash: &mut F) -> Result<(), JournalError> {
         let other_addr = if self.active_sector_addr == self.sectors[0] {
             self.sectors[1]
         } else {
             self.sectors[0]
         };
 
-        nor.erase_sector_4k(other_addr)?;
+        flash.erase_unit(other_addr)?;
 
         let new_gen = self.generation + 1;
         let new_hdr = JournalSectorHeader::new(new_gen);
-        nor.write(other_addr, new_hdr.as_bytes())?;
+        flash.program(other_addr, new_hdr.as_bytes())?;
 
         // Write Slot A snapshot
         let rec_a = JournalRecord::new(
@@ -366,7 +386,7 @@ impl JournalManager {
             self.slot_a.min_version,
             self.slot_a.key_revoke_mask,
         );
-        nor.write(other_addr + 16, rec_a.as_bytes())?;
+        flash.program(other_addr + 16, rec_a.as_bytes())?;
 
         // Write Slot B snapshot
         let rec_b = JournalRecord::new(
@@ -380,11 +400,11 @@ impl JournalManager {
             self.slot_b.min_version,
             self.slot_b.key_revoke_mask,
         );
-        nor.write(other_addr + 16 + RECORD_SIZE as u32, rec_b.as_bytes())?;
+        flash.program(other_addr + 16 + RECORD_SIZE as u32, rec_b.as_bytes())?;
 
         // Verify written snapshot header before erasing old sector
         let mut verify_buf = [0u8; 16];
-        nor.read(other_addr, &mut verify_buf)?;
+        flash.read(other_addr, &mut verify_buf)?;
         let (v_hdr, _) = JournalSectorHeader::ref_from_prefix(&verify_buf)
             .map_err(|_| JournalError::Corrupted)?;
         if !v_hdr.is_valid() {
@@ -392,7 +412,7 @@ impl JournalManager {
         }
 
         // Erase old sector
-        nor.erase_sector_4k(self.active_sector_addr)?;
+        flash.erase_unit(self.active_sector_addr)?;
 
         self.active_sector_addr = other_addr;
         self.generation = new_gen;
@@ -576,7 +596,7 @@ mod tests {
 
         // Flash can only clear bits: zero a CRC byte of the second record.
         let crc_byte = H750_NETLITE.journal[0].offset + 16 + RECORD_SIZE as u32 + 28;
-        nor.write(crc_byte, &[0x00]).unwrap();
+        nor.program(crc_byte, &[0x00]).unwrap();
 
         let re = JournalManager::init(&mut nor, &H750_NETLITE).unwrap();
         assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
@@ -635,5 +655,495 @@ mod tests {
         assert!(at_h750.iter().all(|&b| b == 0xFF), "nothing written at the old location");
         let re = JournalManager::init(&mut nor, &moved).unwrap();
         assert_eq!(re.slot_a.state, SLOT_STATE_CONFIRMED);
+    }
+
+    // --- Flash-trait coverage: the same journal on other devices and geometries ---------------
+
+    use boot_flash::{Flash, RamFlash, F42X_DUAL_BANK_2MB, UNIFORM_4K_4MB};
+    use boot_layout::Region;
+
+    /// 300 appends with every parameter varying; crosses two rollovers on a 4 KiB journal.
+    fn golden_sequence<F: Flash>(flash: &mut F) -> JournalManager {
+        let mut mgr = JournalManager::init(flash, &H750_NETLITE).unwrap();
+        for i in 0..300u32 {
+            let v = ImageVersion {
+                major: 1,
+                minor: (i / 50) as u8,
+                revision: (i % 7) as u16,
+                build_num: i,
+            };
+            let (slot, state, trial, flags) =
+                ((i % 2) as u8, (i % 6) as u8, (i % 4) as u8, (i % 3) as u8);
+            mgr.append_record(flash, slot, state, trial, flags, v, i * 3, (i % 8) as u8)
+                .unwrap();
+        }
+        mgr
+    }
+
+    /// CRC-32 values taken from the journal code as it was before it moved from `NorFlash` to
+    /// `Flash` (commit 9dec531), over the two 4 KiB sectors after `golden_sequence`; computed
+    /// outside this crate with Python `zlib.crc32` over a dump of the flash.
+    const GOLDEN_BOTH_SECTORS_CRC: u32 = 0x8D11_EACB;
+    const GOLDEN_SECTOR0_CRC: u32 = 0x6B95_A23E;
+    const GOLDEN_SECTOR1_CRC: u32 = 0xF154_670A; // erased by the last rollover
+
+    fn assert_golden(image: &[u8], mgr: &JournalManager) {
+        assert_eq!(
+            boot_crc::checksum(&image[..4096]),
+            GOLDEN_SECTOR0_CRC,
+            "sector 0"
+        );
+        assert_eq!(
+            boot_crc::checksum(&image[4096..8192]),
+            GOLDEN_SECTOR1_CRC,
+            "sector 1"
+        );
+        assert_eq!(
+            boot_crc::checksum(&image[..8192]),
+            GOLDEN_BOTH_SECTORS_CRC,
+            "both sectors"
+        );
+        assert_eq!(
+            (
+                mgr.generation,
+                mgr.next_seq,
+                mgr.next_record_offset,
+                mgr.active_sector_addr
+            ),
+            (3, 305, 1616, 0)
+        );
+    }
+
+    #[test]
+    fn journal_writes_the_same_bytes_as_before_the_flash_trait() {
+        let mut nor = RamNor::new(64 * 1024);
+        let mgr = golden_sequence(&mut nor);
+        assert_golden(&nor.mem, &mgr);
+    }
+
+    #[test]
+    fn journal_writes_the_same_bytes_on_ramflash_with_any_program_word() {
+        // byte-programmable, and 4-byte words as on the STM32F4: the format is the same
+        let mut f1 = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        let m1 = golden_sequence(&mut f1);
+        assert_golden(f1.bytes(), &m1);
+        let mut f4 = RamFlash::<4>::new(UNIFORM_4K_4MB);
+        let m4 = golden_sequence(&mut f4);
+        assert_golden(f4.bytes(), &m4);
+    }
+
+    /// A layout whose journal sits in the 128 KiB sectors of an STM32F42x.
+    fn f42x_journal_layout() -> Layout {
+        let mut l = H750_NETLITE;
+        l.journal = [
+            Region::new(0x2_0000, 0x2_0000),
+            Region::new(0x4_0000, 0x2_0000),
+        ];
+        l
+    }
+
+    #[test]
+    fn journal_fills_a_128k_sector_then_rolls_over_and_keeps_its_state() {
+        let layout = f42x_journal_layout();
+        let mut flash = RamFlash::<4>::new(F42X_DUAL_BANK_2MB).dual_bank();
+        let mut mgr = JournalManager::init(&mut flash, &layout).unwrap();
+        assert_eq!((mgr.generation, mgr.active_sector_addr), (1, 0x2_0000));
+        // (131072 - 16-byte header) / 32-byte records = 4095 records fit
+        for i in 0..4095u32 {
+            let v = ImageVersion {
+                major: 1,
+                minor: 0,
+                revision: 0,
+                build_num: i,
+            };
+            mgr.append_record(&mut flash, 0, SLOT_STATE_PENDING, 0, 0, v, 0, 0)
+                .unwrap();
+        }
+        assert_eq!(mgr.next_record_offset, 16 + 4095 * 32);
+        assert_eq!(mgr.generation, 1, "not rolled over yet");
+        // slot B gets a distinct state so the snapshot has to carry both
+        mgr.append_record(&mut flash, 1, SLOT_STATE_CONFIRMED, 0, 0, v1(), 7, 0)
+            .unwrap();
+        assert_eq!(mgr.generation, 2, "the 4096th record rolls over");
+        assert_eq!(mgr.active_sector_addr, 0x4_0000);
+        // header, two snapshots, then the record that triggered the rollover
+        assert_eq!(mgr.next_record_offset, 16 + 3 * 32);
+        // the old 128 KiB sector was erased as one unit
+        assert!(flash.bytes()[0x2_0000..0x4_0000].iter().all(|&b| b == 0xFF));
+
+        let re = JournalManager::init(&mut flash, &layout).unwrap();
+        assert_eq!(re.generation, 2);
+        assert_eq!(re.slot_a.state, SLOT_STATE_PENDING);
+        assert_eq!(re.slot_a.img_ver.build_num, 4094);
+        assert_eq!(re.slot_b.state, SLOT_STATE_CONFIRMED);
+        assert_eq!(re.slot_b.min_version, 7);
+        // nothing outside the two journal sectors was touched
+        let touched = |a: usize| (0x2_0000..0x6_0000).contains(&a);
+        assert!(flash
+            .bytes()
+            .iter()
+            .enumerate()
+            .all(|(a, &b)| touched(a) || b == 0xFF));
+    }
+
+    #[test]
+    fn replay_reads_the_whole_sector_not_just_its_first_4k() {
+        // 4 KiB holds 127 records; a 128 KiB sector holds thousands. After a reboot the state
+        // has to come from the last record, wherever it is.
+        let layout = f42x_journal_layout();
+        let mut flash = RamFlash::<4>::new(F42X_DUAL_BANK_2MB).dual_bank();
+        let mut mgr = JournalManager::init(&mut flash, &layout).unwrap();
+        for i in 0..300u32 {
+            let v = ImageVersion {
+                major: 1,
+                minor: 0,
+                revision: 0,
+                build_num: i,
+            };
+            let slot = (i % 2) as u8;
+            mgr.append_record(
+                &mut flash,
+                slot,
+                SLOT_STATE_TESTING,
+                (i % 3) as u8,
+                0,
+                v,
+                i,
+                0,
+            )
+            .unwrap();
+        }
+        assert_eq!(mgr.generation, 1);
+        let re = JournalManager::init(&mut flash, &layout).unwrap();
+        assert_eq!(re.generation, 1);
+        assert_eq!(re.next_record_offset, 16 + 300 * 32);
+        assert_eq!(re.next_seq, 301);
+        assert_eq!(
+            (re.slot_a.img_ver.build_num, re.slot_a.min_version),
+            (298, 298)
+        );
+        assert_eq!(
+            (re.slot_b.img_ver.build_num, re.slot_b.min_version),
+            (299, 299)
+        );
+        assert_eq!(
+            (re.slot_a.trial, re.slot_b.trial),
+            ((298 % 3) as u8, (299 % 3) as u8)
+        );
+    }
+
+    #[test]
+    fn layouts_that_are_not_whole_erase_units_of_the_device_are_rejected() {
+        let bad = |regions: [Region; 2]| {
+            let mut l = H750_NETLITE;
+            l.journal = regions;
+            l
+        };
+        // On the F42x (units: 16K x4, 64K, 128K x7 per bank).
+        let mut f = RamFlash::<4>::new(F42X_DUAL_BANK_2MB);
+        let cases = [
+            (
+                "64K region inside a 128K sector",
+                [
+                    Region::new(0x2_0000, 0x1_0000),
+                    Region::new(0x4_0000, 0x1_0000),
+                ],
+            ),
+            (
+                "128K region not on a sector start",
+                [
+                    Region::new(0x2_4000, 0x2_0000),
+                    Region::new(0x4_0000, 0x2_0000),
+                ],
+            ),
+            (
+                "the second one not on a sector start",
+                [
+                    Region::new(0x2_0000, 0x2_0000),
+                    Region::new(0x4_4000, 0x2_0000),
+                ],
+            ),
+            (
+                "two sizes, the second not a unit",
+                [
+                    Region::new(0x2_0000, 0x2_0000),
+                    Region::new(0x4_0000, 0x1_0000),
+                ],
+            ),
+            // each one is a whole unit (the 64K sector, a 128K sector) but they differ in size
+            (
+                "two sizes, both whole units",
+                [
+                    Region::new(0x1_0000, 0x1_0000),
+                    Region::new(0x2_0000, 0x2_0000),
+                ],
+            ),
+            (
+                "two regions that span two units",
+                [Region::new(0x0, 0x8000), Region::new(0x8000, 0x8000)],
+            ),
+            (
+                "the same region twice",
+                [
+                    Region::new(0x2_0000, 0x2_0000),
+                    Region::new(0x2_0000, 0x2_0000),
+                ],
+            ),
+            (
+                "offset + len overflows",
+                [
+                    Region::new(0xFFFF_F000, 0x2000),
+                    Region::new(0x4_0000, 0x2000),
+                ],
+            ),
+            (
+                "past the end of the device",
+                [
+                    Region::new(0x20_0000, 0x2_0000),
+                    Region::new(0x22_0000, 0x2_0000),
+                ],
+            ),
+            (
+                "empty regions",
+                [Region::new(0x2_0000, 0), Region::new(0x4_0000, 0)],
+            ),
+        ];
+        for (what, regions) in cases {
+            let r = JournalManager::init(&mut f, &bad(regions));
+            assert!(
+                matches!(r, Err(JournalError::BadLayout)),
+                "{what}: {:?}",
+                r.as_ref().err()
+            );
+        }
+        // and a rejected layout writes nothing
+        assert!(f.bytes().iter().all(|&b| b == 0xFF));
+        // a 4 KiB region on a 4 KiB device is fine, on a 128 KiB-sector device it is not
+        let l4k = bad([Region::new(0x4000, 4096), Region::new(0x5000, 4096)]);
+        assert!(JournalManager::init(&mut RamFlash::<1>::new(UNIFORM_4K_4MB), &l4k).is_ok());
+        assert!(matches!(
+            JournalManager::init(&mut f, &l4k),
+            Err(JournalError::BadLayout)
+        ));
+    }
+
+    #[test]
+    fn a_device_whose_program_word_does_not_divide_the_record_format_is_rejected() {
+        // 16-byte header and 32-byte records: any word up to 16 bytes that divides 16 works,
+        // a 32-byte word (some STM32H7 internal flash) does not.
+        for align in [1u32, 2, 4, 8, 16] {
+            let ok =
+                match align {
+                    1 => JournalManager::init(&mut RamFlash::<1>::new(&[(4096, 4)]), &moved_4k())
+                        .is_ok(),
+                    2 => JournalManager::init(&mut RamFlash::<2>::new(&[(4096, 4)]), &moved_4k())
+                        .is_ok(),
+                    4 => JournalManager::init(&mut RamFlash::<4>::new(&[(4096, 4)]), &moved_4k())
+                        .is_ok(),
+                    8 => JournalManager::init(&mut RamFlash::<8>::new(&[(4096, 4)]), &moved_4k())
+                        .is_ok(),
+                    _ => JournalManager::init(&mut RamFlash::<16>::new(&[(4096, 4)]), &moved_4k())
+                        .is_ok(),
+                };
+            assert!(ok, "program word {align}");
+        }
+        let mut f32 = RamFlash::<32>::new(&[(4096, 4)]);
+        assert!(matches!(
+            JournalManager::init(&mut f32, &moved_4k()),
+            Err(JournalError::BadLayout)
+        ));
+        assert!(
+            f32.bytes().iter().all(|&b| b == 0xFF),
+            "rejected before touching the device"
+        );
+        let mut f3 = RamFlash::<3>::new(&[(4098, 4)]); // 3 does not divide 16 either
+        assert!(matches!(
+            JournalManager::init(&mut f3, &moved_4k()),
+            Err(JournalError::BadLayout)
+        ));
+    }
+
+    fn moved_4k() -> Layout {
+        let mut l = H750_NETLITE;
+        l.journal = [Region::new(0, 4096), Region::new(4096, 4096)];
+        l
+    }
+
+    #[test]
+    fn flash_errors_surface_as_journal_flash_errors() {
+        use boot_flash::{CutMode, FlashError};
+        let mut f = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        f.arm_power_cut(0, CutMode::Clean);
+        let r = JournalManager::init(&mut f, &H750_NETLITE);
+        assert!(
+            matches!(r, Err(JournalError::Flash(FlashError::PowerCut))),
+            "{:?}",
+            r.as_ref().err()
+        );
+    }
+
+    // --- The real SPI driver: what the journal puts on the bus ----------------------------------
+
+    extern crate std;
+    use boot_abi::IoOps;
+    use boot_nor::SpiNorIoOpsDriver;
+    use core::cell::RefCell;
+    use std::thread_local;
+    use std::vec::Vec;
+
+    /// A tiny SPI NOR: 8 KiB of memory behind page program (0x02, bits only clear), sector erase
+    /// (0x20), fast read (0x0B) and the status register (never busy).
+    struct Chip {
+        mem: [u8; 8192],
+        frames: Vec<(u8, u32, u32)>,
+        first: bool,
+        cmd: u8,
+        addr: u32,
+    }
+
+    thread_local! {
+        static CHIP: RefCell<Chip> = const {
+            RefCell::new(Chip { mem: [0xFF; 8192], frames: Vec::new(), first: false, cmd: 0, addr: 0 })
+        };
+    }
+
+    unsafe extern "C" fn bus_cs(assert: bool) {
+        if assert {
+            CHIP.with(|c| {
+                let mut c = c.borrow_mut();
+                c.frames.push((0, 0, 0));
+                c.first = true;
+            });
+        }
+    }
+
+    unsafe extern "C" fn bus_spi(tx: *const u8, rx: *mut u8, len: u32) -> i32 {
+        let rx = core::slice::from_raw_parts_mut(rx, len as usize);
+        rx.fill(0);
+        CHIP.with(|c| {
+            let mut c = c.borrow_mut();
+            let first = c.first;
+            c.first = false;
+            c.frames.last_mut().unwrap().2 += len;
+            if first {
+                let t = core::slice::from_raw_parts(tx, len as usize);
+                let addr = if t.len() >= 4 {
+                    u32::from(t[1]) << 16 | u32::from(t[2]) << 8 | u32::from(t[3])
+                } else {
+                    0
+                };
+                c.cmd = t[0];
+                c.addr = addr;
+                *c.frames.last_mut().unwrap() = (t[0], addr, len);
+                if t[0] == 0x20 {
+                    let s = (addr & !0xFFF) as usize;
+                    c.mem[s..s + 4096].fill(0xFF);
+                }
+            } else if c.cmd == 0x02 {
+                let t = core::slice::from_raw_parts(tx, len as usize);
+                let a = c.addr as usize;
+                for (i, &b) in t.iter().enumerate() {
+                    c.mem[a + i] &= b;
+                }
+            } else if c.cmd == 0x0B {
+                let a = c.addr as usize;
+                rx.copy_from_slice(&c.mem[a..a + len as usize]);
+            }
+        });
+        0
+    }
+
+    unsafe extern "C" fn bus_millis() -> u32 {
+        0
+    }
+
+    unsafe extern "C" fn bus_yield() {}
+
+    static BUS_IO: IoOps = IoOps {
+        spi_transfer: Some(bus_spi),
+        cs: Some(bus_cs),
+        millis: bus_millis,
+        yield_: bus_yield,
+        reserved: [0; 4],
+    };
+
+    /// Serialises the frames: command, 3 address bytes (big endian), clocked bytes (u32 LE).
+    fn frames_as_bytes() -> Vec<u8> {
+        CHIP.with(|c| {
+            let mut out = Vec::new();
+            for &(cmd, addr, len) in &c.borrow().frames {
+                out.push(cmd);
+                out.extend_from_slice(&addr.to_be_bytes()[1..]);
+                out.extend_from_slice(&len.to_le_bytes());
+            }
+            out
+        })
+    }
+
+    /// A blank chip: init (erase sector 0, write a header), 127 appends that fill the sector, one
+    /// more that rolls over (erase the other sector, header, two snapshots, read back, erase the
+    /// old one), and a final append.
+    fn bus_scenario() -> (Vec<u8>, Vec<u8>) {
+        CHIP.with(|c| {
+            let mut c = c.borrow_mut();
+            c.mem = [0xFF; 8192];
+            c.frames.clear();
+        });
+        let mut driver = SpiNorIoOpsDriver::new(&BUS_IO);
+        let mut mgr = JournalManager::init(&mut driver, &H750_NETLITE).unwrap();
+        for i in 0..128u32 {
+            let v = ImageVersion {
+                major: 1,
+                minor: 0,
+                revision: 0,
+                build_num: i,
+            };
+            mgr.append_record(
+                &mut driver,
+                (i % 2) as u8,
+                SLOT_STATE_PENDING,
+                0,
+                0,
+                v,
+                i,
+                0,
+            )
+            .unwrap();
+        }
+        mgr.append_record(&mut driver, 1, SLOT_STATE_CONFIRMED, 0, 0, v1(), 1, 0)
+            .unwrap();
+        assert_eq!(mgr.generation, 2, "the scenario must include a rollover");
+        let mem = CHIP.with(|c| c.borrow().mem.to_vec());
+        (frames_as_bytes(), mem)
+    }
+
+    // From the journal as it was before it moved to `Flash` (commit 9dec531), over the same
+    // scenario; CRC-32s computed outside this crate with Python `zlib.crc32`.
+    const GOLDEN_BUS_FRAMES: usize = 457;
+    const GOLDEN_BUS_FRAMES_CRC: u32 = 0xDA3C_FDAE;
+    const GOLDEN_BUS_CHIP_CRC: u32 = 0x861D_02C6;
+
+    #[test]
+    fn journal_puts_the_same_commands_on_the_spi_bus_as_before_the_flash_trait() {
+        let (frames, chip) = bus_scenario();
+        assert_eq!(frames.len() / 8, GOLDEN_BUS_FRAMES);
+        assert_eq!(
+            boot_crc::checksum(&frames),
+            GOLDEN_BUS_FRAMES_CRC,
+            "command/address/length sequence"
+        );
+        assert_eq!(
+            boot_crc::checksum(&chip),
+            GOLDEN_BUS_CHIP_CRC,
+            "final chip contents"
+        );
+        // and, written out by hand: the sector erases are init (sector 0), then the rollover
+        // erases the other sector first and the old one last
+        let erases: Vec<u32> = frames
+            .chunks(8)
+            .filter(|f| f[0] == 0x20)
+            .map(|f| u32::from_be_bytes([0, f[1], f[2], f[3]]))
+            .collect();
+        assert_eq!(erases, [0x0000, 0x1000, 0x0000]);
     }
 }

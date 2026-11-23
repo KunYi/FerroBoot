@@ -252,7 +252,7 @@ impl UpdateSession {
     }
 
     /// Finalizes the update session, verifies signature, and updates journal to Pending.
-    pub fn finish<F: NorFlash>(
+    pub fn finish<F: boot_flash::Flash>(
         &mut self,
         nor: &mut F,
         journal: &mut JournalManager,
