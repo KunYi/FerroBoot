@@ -370,9 +370,12 @@ impl JournalManager {
 
         flash.erase_unit(other_addr)?;
 
+        // The header goes in last. A sector only counts as part of the journal once its header
+        // is valid, and `init` prefers the higher generation, so a header written before the
+        // snapshots would make a power cut in between promote an empty sector over the old,
+        // complete one and lose every slot state.
         let new_gen = self.generation + 1;
         let new_hdr = JournalSectorHeader::new(new_gen);
-        flash.program(other_addr, new_hdr.as_bytes())?;
 
         // Write Slot A snapshot
         let rec_a = JournalRecord::new(
@@ -401,6 +404,9 @@ impl JournalManager {
             self.slot_b.key_revoke_mask,
         );
         flash.program(other_addr + 16 + RECORD_SIZE as u32, rec_b.as_bytes())?;
+
+        // Both snapshots are in; this makes the new sector valid.
+        flash.program(other_addr, new_hdr.as_bytes())?;
 
         // Verify written snapshot header before erasing old sector
         let mut verify_buf = [0u8; 16];
@@ -1117,10 +1123,13 @@ mod tests {
         (frames_as_bytes(), mem)
     }
 
-    // From the journal as it was before it moved to `Flash` (commit 9dec531), over the same
-    // scenario; CRC-32s computed outside this crate with Python `zlib.crc32`.
+    // Recorded from the journal as it was before it moved to `Flash` (commit 9dec531) over the
+    // same scenario; CRC-32s computed outside this crate with Python `zlib.crc32`. The chip
+    // contents are the old ones unchanged. The frame CRC is the old frame sequence with the
+    // rollover's three programs permuted from header, A, B to A, B, header (done in Python on
+    // the recorded frames, not by running this code): same frames, header last.
     const GOLDEN_BUS_FRAMES: usize = 457;
-    const GOLDEN_BUS_FRAMES_CRC: u32 = 0xDA3C_FDAE;
+    const GOLDEN_BUS_FRAMES_CRC: u32 = 0x005D_9A4E;
     const GOLDEN_BUS_CHIP_CRC: u32 = 0x861D_02C6;
 
     #[test]
@@ -1145,5 +1154,316 @@ mod tests {
             .map(|f| u32::from_be_bytes([0, f[1], f[2], f[3]]))
             .collect();
         assert_eq!(erases, [0x0000, 0x1000, 0x0000]);
+        // The rollover then programs the two snapshots and, last, the header that makes the new
+        // sector valid.
+        let after_erase = frames.chunks(8).skip_while(|f| f[0] != 0x20 || f[1..4] != [0, 0x10, 0]);
+        let programs: Vec<u32> = after_erase
+            .filter(|f| f[0] == 0x02)
+            .take(3)
+            .map(|f| u32::from_be_bytes([0, f[1], f[2], f[3]]))
+            .collect();
+        assert_eq!(programs, [0x1010, 0x1030, 0x1000]);
+    }
+
+    // --- Power-cut sweep ---------------------------------------------------------------------
+    //
+    // For every step an operation takes (each programmed word, each erase), cut the power there,
+    // reboot, and check what the journal says. Whatever the cut point, the journal must open,
+    // the slot states must be either exactly what they were before the operation or exactly what
+    // they are after it (never a mix, never lost), and it must keep working.
+
+    use boot_flash::CutMode;
+
+    type States = (SlotJournalState, SlotJournalState);
+
+    fn states(m: &JournalManager) -> States {
+        (m.slot_a, m.slot_b)
+    }
+
+    /// Runs `op` on a copy of `base` with the power cut at every step it takes, in both cut modes,
+    /// and calls `check(after_reboot, cut_step, mode)` each time. Returns the number of steps.
+    fn sweep<const A: u32>(
+        base: &RamFlash<A>,
+        layout: &Layout,
+        op: impl Fn(&mut RamFlash<A>, &mut JournalManager) -> Result<(), JournalError>,
+        check: impl Fn(&mut RamFlash<A>, JournalManager, u64, CutMode),
+    ) -> u64 {
+        // How many steps does the operation take when nothing goes wrong?
+        let mut probe = base.clone();
+        let mut mgr = JournalManager::init(&mut probe, layout).unwrap();
+        let before = probe.steps();
+        op(&mut probe, &mut mgr).unwrap();
+        let total = probe.steps() - before;
+        assert!(total > 0);
+        for mode in [CutMode::Clean, CutMode::Torn] {
+            for k in 0..total {
+                let mut f = base.clone();
+                let mut mgr = JournalManager::init(&mut f, layout).unwrap();
+                f.arm_power_cut(f.steps() + k, mode);
+                assert!(
+                    op(&mut f, &mut mgr).is_err(),
+                    "a cut at step {k} must stop the operation"
+                );
+                f.power_on();
+                let re = JournalManager::init(&mut f, layout).unwrap_or_else(|e| {
+                    panic!("{mode:?} cut at step {k}/{total}: journal does not open: {e:?}")
+                });
+                check(&mut f, re, k, mode);
+            }
+        }
+        total
+    }
+
+    /// The journal must be usable after a cut: one more record goes in and survives a reboot.
+    fn assert_still_usable<const A: u32>(
+        f: &mut RamFlash<A>,
+        layout: &Layout,
+        mut re: JournalManager,
+        what: &str,
+    ) {
+        let v = ImageVersion {
+            major: 9,
+            minor: 9,
+            revision: 9,
+            build_num: 9,
+        };
+        re.append_record(f, 1, SLOT_STATE_INVALID, 0, 0, v, 99, 0)
+            .unwrap_or_else(|e| panic!("{what}: append after reboot failed: {e:?}"));
+        let again = JournalManager::init(f, layout).unwrap();
+        assert_eq!(again.slot_b.state, SLOT_STATE_INVALID, "{what}");
+        assert_eq!(again.slot_b.min_version, 99, "{what}");
+    }
+
+    /// A journal whose next append will roll over, with distinct, recognisable state in both slots.
+    fn journal_about_to_roll_over<const A: u32>(
+        f: &mut RamFlash<A>,
+        layout: &Layout,
+    ) -> JournalManager {
+        let mut m = JournalManager::init(f, layout).unwrap();
+        let capacity = (layout.journal[0].len - 16) / RECORD_SIZE as u32;
+        let va = ImageVersion {
+            major: 1,
+            minor: 2,
+            revision: 3,
+            build_num: 4,
+        };
+        let vb = ImageVersion {
+            major: 5,
+            minor: 6,
+            revision: 7,
+            build_num: 8,
+        };
+        m.append_record(f, 0, SLOT_STATE_CONFIRMED, 0, 0, va, 11, 0)
+            .unwrap();
+        m.append_record(f, 1, SLOT_STATE_TESTING, 2, 0, vb, 22, 0)
+            .unwrap();
+        for _ in 2..capacity {
+            m.append_record(f, 1, SLOT_STATE_TESTING, 2, 0, vb, 22, 0)
+                .unwrap();
+        }
+        assert_eq!(
+            m.next_record_offset + RECORD_SIZE as u32 > layout.journal[0].len,
+            true,
+            "full"
+        );
+        m
+    }
+
+    /// An append that changes slot A and, when the sector is full, rolls the journal over.
+    fn rollover_op<const A: u32>(
+        build: u32,
+    ) -> impl Fn(&mut RamFlash<A>, &mut JournalManager) -> Result<(), JournalError> {
+        move |f, m| {
+            let v = ImageVersion {
+                major: 1,
+                minor: 2,
+                revision: 3,
+                build_num: build,
+            };
+            m.append_record(f, 0, SLOT_STATE_PENDING, 0, 0, v, 30 + build, 0)
+        }
+    }
+
+    /// Appends (to slot B, leaving slot A alone) until the next append would roll over.
+    fn fill_until_full<const A: u32>(f: &mut RamFlash<A>, layout: &Layout, m: &mut JournalManager) {
+        let vb = ImageVersion {
+            major: 5,
+            minor: 6,
+            revision: 7,
+            build_num: 8,
+        };
+        while m.next_record_offset + RECORD_SIZE as u32 <= layout.journal[0].len {
+            m.append_record(f, 1, SLOT_STATE_TESTING, 2, 0, vb, 22, 0)
+                .unwrap();
+        }
+    }
+
+    fn assert_atomic<const A: u32>(
+        base: &RamFlash<A>,
+        layout: &Layout,
+        op: impl Fn(&mut RamFlash<A>, &mut JournalManager) -> Result<(), JournalError>,
+        what: &str,
+    ) -> u64 {
+        // the two acceptable outcomes, from runs without any cut
+        let mut f0 = base.clone();
+        let m0 = JournalManager::init(&mut f0, layout).unwrap();
+        let before = states(&m0);
+        let mut f1 = base.clone();
+        let mut m1 = JournalManager::init(&mut f1, layout).unwrap();
+        op(&mut f1, &mut m1).unwrap();
+        let after = states(&m1);
+        assert_ne!(before, after);
+        sweep(base, layout, &op, |f, re, k, mode| {
+            let got = states(&re);
+            assert!(
+                got == before || got == after,
+                "{what}: {mode:?} cut at step {k}: slot states are neither the old nor the new ones\n  got    {got:?}\n  before {before:?}\n  after  {after:?}"
+            );
+            assert_still_usable(
+                f,
+                layout,
+                re,
+                &std::format!("{what}: {mode:?} cut at step {k}"),
+            );
+        })
+    }
+
+    #[test]
+    fn power_cut_at_any_step_of_an_append_loses_nothing_on_the_h750() {
+        let mut base = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        let mut m = JournalManager::init(&mut base, &H750_NETLITE).unwrap();
+        let v = ImageVersion {
+            major: 1,
+            minor: 0,
+            revision: 0,
+            build_num: 1,
+        };
+        m.append_record(&mut base, 0, SLOT_STATE_CONFIRMED, 0, 0, v, 1, 0)
+            .unwrap();
+        let n = assert_atomic(&base, &H750_NETLITE, rollover_op::<1>(5), "append, H750");
+        assert_eq!(n, 32, "one 32-byte record, one step per byte");
+    }
+
+    #[test]
+    fn power_cut_during_the_very_first_init_leaves_a_usable_journal() {
+        // A blank device: init erases sector 0 and writes the header.
+        let base = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        let mut probe = base.clone();
+        JournalManager::init(&mut probe, &H750_NETLITE).unwrap();
+        let total = probe.steps();
+        assert_eq!(total, 1 + 16, "one erase, a 16-byte header");
+        for mode in [CutMode::Clean, CutMode::Torn] {
+            for k in 0..total {
+                let mut f = base.clone();
+                f.arm_power_cut(k, mode);
+                assert!(JournalManager::init(&mut f, &H750_NETLITE).is_err());
+                f.power_on();
+                let re = JournalManager::init(&mut f, &H750_NETLITE)
+                    .unwrap_or_else(|e| panic!("{mode:?} cut at step {k}: {e:?}"));
+                assert_eq!(
+                    states(&re),
+                    (SlotJournalState::default(), SlotJournalState::default())
+                );
+                assert_still_usable(
+                    &mut f,
+                    &H750_NETLITE,
+                    re,
+                    &std::format!("first init, {mode:?} cut at step {k}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn power_cut_at_any_step_of_a_rollover_loses_nothing_on_the_h750() {
+        let mut base = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        journal_about_to_roll_over(&mut base, &H750_NETLITE);
+        let n = assert_atomic(&base, &H750_NETLITE, rollover_op::<1>(5), "rollover, H750");
+        // erase, 16-byte header, two 32-byte snapshots, erase, one 32-byte record
+        assert_eq!(n, 1 + 16 + 64 + 1 + 32);
+    }
+
+    #[test]
+    fn power_cut_at_any_step_of_a_second_rollover_loses_nothing_on_the_h750() {
+        // After one rollover the active and the spare sector have swapped roles.
+        let mut base = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        let mut m = journal_about_to_roll_over(&mut base, &H750_NETLITE);
+        rollover_op::<1>(5)(&mut base, &mut m).unwrap();
+        assert_eq!((m.generation, m.active_sector_addr), (2, 0x1000));
+        fill_until_full(&mut base, &H750_NETLITE, &mut m);
+        let n = assert_atomic(
+            &base,
+            &H750_NETLITE,
+            rollover_op::<1>(6),
+            "second rollover, H750",
+        );
+        assert_eq!(n, 1 + 16 + 64 + 1 + 32);
+        // the sweep itself ends on the other side: generation 3, back on sector 0
+        let mut f = base.clone();
+        let mut m = JournalManager::init(&mut f, &H750_NETLITE).unwrap();
+        rollover_op::<1>(6)(&mut f, &mut m).unwrap();
+        assert_eq!((m.generation, m.active_sector_addr), (3, 0));
+    }
+
+    #[test]
+    fn with_two_valid_sectors_init_takes_the_higher_generation_in_either_position() {
+        // A cut right after the new header is in and before the old sector is erased leaves two
+        // valid sectors. The new one (higher generation) must win, whichever of the two it is.
+        // Steps before that cut: erase 1, two 32-byte snapshots 64, the 16-byte header 16.
+        let cut_before_the_old_sector_is_erased = 1 + 64 + 16;
+
+        // Round 0: a full sector 0 (generation 1). Round 1: the same after one real rollover, so
+        // the journal is in sector 1 (generation 2) and sector 0 is the spare.
+        let mut first = RamFlash::<1>::new(UNIFORM_4K_4MB);
+        journal_about_to_roll_over(&mut first, &H750_NETLITE);
+        let mut second = first.clone();
+        let mut m2 = JournalManager::init(&mut second, &H750_NETLITE).unwrap();
+        rollover_op::<1>(5)(&mut second, &mut m2).unwrap();
+        fill_until_full(&mut second, &H750_NETLITE, &mut m2);
+
+        // (device, the append that rolls over, expected generation and sector after the cut)
+        let rounds = [(first, 5, 2u32, 0x1000u32), (second, 6, 3, 0x0000)];
+        for (round, (base, build, generation, active)) in rounds.into_iter().enumerate() {
+            let mut f = base.clone();
+            let before = states(&JournalManager::init(&mut f, &H750_NETLITE).unwrap());
+            f.arm_power_cut(
+                f.steps() + cut_before_the_old_sector_is_erased,
+                CutMode::Clean,
+            );
+            let mut m = JournalManager::init(&mut f, &H750_NETLITE).unwrap();
+            assert!(rollover_op::<1>(build)(&mut f, &mut m).is_err());
+            f.power_on();
+            // both sectors really are valid now
+            for at in [0u32, 0x1000] {
+                let mut b = [0u8; 16];
+                f.read(at, &mut b).unwrap();
+                let valid = JournalSectorHeader::ref_from_prefix(&b)
+                    .unwrap()
+                    .0
+                    .is_valid();
+                assert!(valid, "round {round}: header at {at:#x} should be valid");
+            }
+            let re = JournalManager::init(&mut f, &H750_NETLITE).unwrap();
+            assert_eq!(
+                (re.generation, re.active_sector_addr),
+                (generation, active),
+                "round {round}"
+            );
+            assert_eq!(
+                states(&re),
+                before,
+                "round {round}: the snapshots carry the old state"
+            );
+        }
+    }
+
+    #[test]
+    fn power_cut_at_any_step_of_a_rollover_loses_nothing_on_the_f42x() {
+        let layout = f42x_journal_layout();
+        let mut base = RamFlash::<4>::new(F42X_DUAL_BANK_2MB).dual_bank();
+        journal_about_to_roll_over(&mut base, &layout);
+        let n = assert_atomic(&base, &layout, rollover_op::<4>(5), "rollover, F42x");
+        // erase, 4-word header, two 8-word snapshots, erase, one 8-word record
+        assert_eq!(n, 1 + 4 + 16 + 1 + 8);
     }
 }
