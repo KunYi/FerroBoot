@@ -22,4 +22,6 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 boot-nor = { workspace = true, features = ["std"] }
+boot-flash = { workspace = true, features = ["std"] }
+boot-crc = { workspace = true }
 boot-journal = { workspace = true, features = ["std"] }

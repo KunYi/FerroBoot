@@ -262,6 +262,7 @@ version = "0.2.0"
 dependencies = [
  "boot-abi",
  "boot-core",
+ "boot-crc",
  "boot-crypto",
  "boot-flash",
  "boot-image",
