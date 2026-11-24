@@ -2,6 +2,7 @@
 import os
 import random
 import sys
+import time
 import types
 import unittest
 
@@ -221,9 +222,284 @@ class EraseReply(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "0 erase steps"):
             rescue_upload.read_erase_reply(link, 3.0, now=link.now)
 
+    def test_the_whole_line_is_consumed_so_the_next_reply_is_read_cleanly(self):
+        # What the board sends for 'e' and then for the first 'w'. Stopping the erase reply at the
+        # '\r' leaves the '\n' behind, and the next read_line returns '' at once ("ERROR at
+        # offset 0x0: ''" on the first board run).
+        link = FakeLink(at([(0.1, b".."), (0.2, b"OK\r\n"), (0.5, b"OK\r\n")]))
+        self.assertEqual(rescue_upload.read_erase_reply(link, 5.0, now=link.now), (2, "OK"))
+        self.assertEqual(rescue_upload.read_line(link, 3.0, now=link.now), "OK")
+        self.assertEqual(link.arrivals, [], "everything the board sent has been read")
+
+    def test_a_reply_that_is_only_a_newline_ends_at_the_newline(self):
+        link = FakeLink(at([(0.1, b"."), (0.2, b"OK\n"), (0.5, b"OK\n")]))
+        self.assertEqual(rescue_upload.read_erase_reply(link, 5.0, now=link.now), (1, "OK"))
+        self.assertEqual(rescue_upload.read_line(link, 3.0, now=link.now), "OK")
+
     def test_blank_lines_before_the_reply_are_skipped(self):
         link = FakeLink(at([(0.1, b"\r\n"), (0.2, b"."), (0.3, b"\r\n"), (0.4, b"OK\r\n")]))
         self.assertEqual(rescue_upload.read_erase_reply(link, 5.0, now=link.now), (1, "OK"))
+
+
+class FakeBoard:
+    """A bootloader's rescue mode as seen over the wire, byte for byte as the firmware answers.
+
+    Replies end in CRLF, `e` prints one '.' per erase step then OK, `w` takes its payload after the
+    header line and checks range and alignment. The flash starts erased (0xFF).
+    """
+
+    def __init__(self, info, slot_len=655360, steps=10, drop_erase_reply_after=None,
+                 erase_error_after=None):
+        self.info = info
+        self.slot_len = slot_len
+        self.steps = steps
+        self.drop_after = drop_erase_reply_after  # stall after this many dots
+        self.error_after = erase_error_after      # answer ERR after this many dots
+        self.flash = {0: bytearray(b"\xff" * slot_len), 1: bytearray(b"\xff" * slot_len)}
+        self.rx = bytearray()   # what the host has sent and the board has not parsed yet
+        self.tx = bytearray()   # what the board has sent and the host has not read yet
+        self.log = []
+        self.marked = []
+        self.unread_at_reboot = None
+
+    # --- the serial port the tool sees ---
+    def write(self, data):
+        self.rx += data
+        self._run()
+
+    def flush(self):
+        pass
+
+    def reset_input_buffer(self):
+        self.tx.clear()
+
+    def read(self, n):
+        if self.tx:
+            return bytes([self.tx.pop(0)])
+        time.sleep(0.001)
+        return b""
+
+    # --- the board ---
+    def _line(self):
+        i = self.rx.find(b"\n")
+        if i < 0:
+            return None
+        line = bytes(self.rx[:i]).decode()
+        del self.rx[:i + 1]
+        return line
+
+    def _run(self):
+        while self.rx:
+            c = chr(self.rx[0])
+            if c in "pir":
+                del self.rx[0]
+                self.log.append(c)
+                if c == "r":
+                    self.unread_at_reboot = bytes(self.tx)
+                self.tx += {"p": b"PONG\r\n", "i": self.info.encode() + b"\r\n", "r": b"REBOOT\r\n"}[c]
+            elif c in "em":
+                line = self._line()
+                if line is None:
+                    return
+                self.log.append(line)
+                slot = int(line.split()[1])
+                if c == "m":
+                    self.marked.append(slot)
+                    self.tx += b"OK\r\n"
+                    continue
+                self.flash[slot][:] = b"\xff" * self.slot_len
+                n = self.steps if self.drop_after is None else self.drop_after
+                if self.error_after is not None:
+                    self.tx += b"." * self.error_after + b"ERR\r\n"
+                    continue
+                self.tx += b"." * n
+                if self.drop_after is None:
+                    self.tx += b"OK\r\n"
+            elif c == "w":
+                head = bytes(self.rx)
+                i = head.find(b"\n")
+                if i < 0:
+                    return
+                _, slot, off, ln = head[:i].decode().split()
+                slot, off, ln = int(slot), int(off, 16), int(ln, 16)
+                if len(self.rx) < i + 1 + ln:
+                    return
+                payload = bytes(self.rx[i + 1:i + 1 + ln])
+                del self.rx[:i + 1 + ln]
+                self.log.append(f"w {slot} {off:x} {ln:x}")
+                align = int(self.info.split(" align=")[1].split()[0])
+                chunk = int(self.info.split(" chunk=")[1].split()[0])
+                if ln > chunk:
+                    self.tx += b"ERR_LEN\r\n"
+                elif off + ln > self.slot_len:
+                    self.tx += b"ERR_RANGE\r\n"
+                elif off % align or ln % align:
+                    self.tx += b"ERR_ALIGN\r\n"
+                else:
+                    self.flash[slot][off:off + ln] = payload
+                    self.tx += b"OK\r\n"
+            else:
+                del self.rx[0]  # like the firmware: ignore stray bytes
+
+
+class EndToEnd(unittest.TestCase):
+    """rescue_upload.main() against FakeBoard: the exchange as a whole, not just its helpers."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def image(self, size):
+        body = bytes((i * 7 + 3) & 0xFF for i in range(size - 32))
+        path = os.path.join(self.tmp.name, f"img{size}.bin")
+        with open(path, "wb") as f:
+            f.write(XTASK_HEADER_4_2_3_B7 + body)
+        return path, XTASK_HEADER_4_2_3_B7 + body
+
+    def upload(self, board, path, *extra, slot="0"):
+        argv = ["rescue_upload.py", "--port", "fake", "--image", path, "--slot", slot, *extra]
+        fake_serial = types.SimpleNamespace(Serial=lambda *a, **k: board)
+        old = (sys.argv, rescue_upload.serial)
+        sys.argv, rescue_upload.serial = argv, fake_serial
+        try:
+            rescue_upload.main()
+        finally:
+            sys.argv, rescue_upload.serial = old
+
+    def quiet(self):
+        import contextlib
+        import io
+        return contextlib.redirect_stdout(io.StringIO())
+
+    def test_a_whole_upload_to_the_h750_ends_with_the_image_in_the_slot_and_marked(self):
+        path, img = self.image(4584)  # the size from the board run that found the CRLF bug
+        board = FakeBoard(H750_INFO)
+        with self.quiet():
+            self.upload(board, path)
+        self.assertEqual(bytes(board.flash[0][:len(img)]), img)
+        self.assertTrue(all(b == 0xFF for b in board.flash[0][len(img):]))
+        self.assertEqual(board.marked, [0])
+        self.assertEqual(board.log[:3], ["p", "i", "e 0"])
+        self.assertEqual(board.log[-1], "r")
+        # Every reply the board had sent was read before the tool asked for the reboot. A byte
+        # left behind (the '\n' of an 'OK\r\n') would make the next read_line return '' at once.
+        self.assertEqual(board.unread_at_reboot, b"")
+        writes = [x for x in board.log if x.startswith("w ")]
+        self.assertEqual(writes[0], "w 0 0 200")
+        self.assertEqual(len(writes), 9)  # 4584 = 8 x 512 + 488
+
+    def test_slot_1_is_erased_written_and_marked_and_slot_0_is_left_alone(self):
+        path, img = self.image(4584)
+        board = FakeBoard(H750_INFO)
+        board.flash[0][:4] = b"keep"
+        with self.quiet():
+            self.upload(board, path, slot="1")
+        self.assertEqual(bytes(board.flash[1][:len(img)]), img)
+        self.assertEqual(bytes(board.flash[0][:4]), b"keep")
+        self.assertEqual(board.marked, [1])
+        self.assertIn("e 1", board.log)
+        self.assertTrue(all(x.startswith("w 1 ") for x in board.log if x.startswith("w ")))
+
+    def test_no_mark_and_no_reboot_are_honoured(self):
+        path, img = self.image(4584)
+        board = FakeBoard(H750_INFO)
+        with self.quiet():
+            self.upload(board, path, "--no-mark", "--no-reboot")
+        self.assertEqual(bytes(board.flash[0][:len(img)]), img)
+        self.assertEqual(board.marked, [])
+        self.assertNotIn("r", board.log)
+
+    def test_a_word_programmed_board_gets_a_padded_last_chunk(self):
+        info = H750_INFO.replace("align=1", "align=4")
+        path, img = self.image(4585)  # not a multiple of 4
+        board = FakeBoard(info)
+        with self.quiet():
+            self.upload(board, path)
+        self.assertEqual(bytes(board.flash[0][:len(img)]), img)
+        self.assertEqual(bytes(board.flash[0][len(img):len(img) + 3]), b"\xff" * 3)
+        self.assertEqual(board.marked, [0])
+        # 4585 = 8 x 512 + 489; the last piece is rounded up to a whole 4-byte word (492 = 0x1ec)
+        last_off = 4585 // 512 * 512
+        last_len = -(-(4585 - last_off) // 4) * 4
+        self.assertEqual((last_off, last_len), (0x1000, 0x1EC))
+        self.assertEqual([x for x in board.log if x.startswith("w ")][-1], f"w 0 {last_off:x} {last_len:x}")
+
+    def test_an_old_bootloader_is_refused_before_anything_is_erased(self):
+        path, _ = self.image(4584)
+        board = FakeBoard("[RESCUE] BL v1.0, STM32H750, NOR BY25Q32ES")
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path)
+        self.assertIn("cannot talk to this bootloader", str(cm.exception))
+        self.assertEqual(board.log, ["p", "i"])
+
+    def test_another_protocol_version_is_refused_before_anything_is_erased(self):
+        path, _ = self.image(4584)
+        board = FakeBoard(H750_INFO.replace("proto=2", "proto=3"))
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path)
+        self.assertIn("protocol 3", str(cm.exception))
+        self.assertEqual(board.log, ["p", "i"])
+
+    def test_an_image_bigger_than_the_slot_is_refused_before_the_erase(self):
+        path, _ = self.image(655360 + 1)
+        board = FakeBoard(H750_INFO)
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path)
+        self.assertIn("a slot holds at most 655360", str(cm.exception))
+        self.assertEqual(board.log, ["p", "i"])
+
+    def test_an_erase_that_fails_stops_the_upload_before_any_write(self):
+        path, _ = self.image(4584)
+        board = FakeBoard(H750_INFO, erase_error_after=2)
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path)
+        self.assertIn("erase failed after 2 steps", str(cm.exception))
+        self.assertIn("'ERR'", str(cm.exception))
+        self.assertFalse([x for x in board.log if x.startswith("w ")])
+        self.assertEqual(board.marked, [])
+
+    def test_the_chunk_size_comes_from_the_info_line(self):
+        path, img = self.image(1000)
+        board = FakeBoard(H750_INFO.replace("chunk=512", "chunk=128"))  # refuses anything bigger
+        with self.quiet():
+            self.upload(board, path)
+        self.assertEqual(bytes(board.flash[0][:len(img)]), img)
+        lens = [int(x.split()[3], 16) for x in board.log if x.startswith("w ")]
+        self.assertEqual(lens, [128] * 7 + [104])  # 1000 = 7 x 128 + 104
+
+    def test_the_slot_size_comes_from_the_slot_asked_for(self):
+        path, _ = self.image(4584)
+        info = H750_INFO.replace("slot1=655360", "slot1=4096")
+        board = FakeBoard(info)
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path, slot="1")
+        self.assertIn("a slot holds at most 4096", str(cm.exception))
+        self.assertEqual(board.log, ["p", "i"])
+        # the same image is fine for slot 0
+        board = FakeBoard(info)
+        with self.quiet():
+            self.upload(board, path, slot="0")
+        self.assertEqual(board.marked, [0])
+
+    def test_an_erase_that_goes_silent_is_reported_by_the_step_timeout(self):
+        path, _ = self.image(4584)
+        board = FakeBoard(H750_INFO, drop_erase_reply_after=3)
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path, "--step-timeout", "0.3")
+        self.assertIn("3 erase steps", str(cm.exception))
+        self.assertNotIn("m 0", board.log)
+
+    def test_a_refused_write_stops_the_upload_with_the_boards_reply(self):
+        # a board whose slot is smaller than it said: the first write inside it works, a later one
+        # is refused with ERR_RANGE
+        path, _ = self.image(4584)
+        board = FakeBoard(H750_INFO, slot_len=2048)
+        with self.quiet(), self.assertRaises(SystemExit) as cm:
+            self.upload(board, path)
+        self.assertIn("'ERR_RANGE'", str(cm.exception))
+        self.assertIn("0x800", str(cm.exception))
+        self.assertEqual(board.marked, [])
 
 
 if __name__ == "__main__":

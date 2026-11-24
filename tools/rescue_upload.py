@@ -116,11 +116,11 @@ def plan_chunks(img, chunk, align):
         off += len(piece)
 
 
-def read_line(ser, timeout):
+def read_line(ser, timeout, now=time.time):
     """Read until CRLF or timeout; return decoded text."""
-    end = time.time() + timeout
+    end = now() + timeout
     buf = b""
-    while time.time() < end:
+    while now() < end:
         b = ser.read(1)
         if b:
             buf += b
