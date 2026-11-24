@@ -8,7 +8,7 @@
 
 use boot_abi::*;
 use boot_core::{decide, trial_step, BootDecision, SlotLoader, DEFAULT_MAX_TRIALS};
-use boot_rescue::{drain_len, parse_slot, slot_erase_blocks, write_address};
+use boot_rescue::{drain_len, parse_slot, write_address, write_info, SlotErase};
 use boot_crypto::{KeyTable, SecretsTable, KEYTABLE_MAGIC, SECRETS_MAGIC};
 use boot_journal::{JournalError, JournalManager, SlotJournalState};
 use boot_layout::{AddrRegion, ExecModel, Layout, H750_NETLITE, H750_NETLITE_BOARD_ID};
@@ -654,6 +654,16 @@ fn read_delimited_hex() -> (Option<u32>, u8) {
     }
 }
 
+/// Lets the pure `write_info` write straight to the UART.
+struct UartOut;
+
+impl core::fmt::Write for UartOut {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        uart_write_str(s);
+        Ok(())
+    }
+}
+
 fn enter_rescue_mode(_reason: u8) -> ! {
     set_led(true);
     uart_write_str("[RESCUE] Entering UART Rescue Mode. Ready.\r\n");
@@ -669,11 +679,21 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                 uart_write_str("PONG\r\n");
             }
             b'i' | b'I' => {
-                // Info
-                uart_write_str("[RESCUE] BL v1.0, STM32H750, NOR BY25Q32ES\r\n");
+                // Info: one INFO line with the protocol version and the device parameters the
+                // host needs (program word, chunk size, slot sizes, RAM window).
+                let _ = write_info(
+                    &mut UartOut,
+                    layout(),
+                    boot_flash::Flash::capacity(&nor),
+                    <SpiNorIoOpsDriver as boot_flash::Flash>::PROGRAM_ALIGN,
+                    BOOTLOADER_INFO.bl_version,
+                );
+                uart_write_str("\r\n");
             }
             b'e' | b'E' => {
-                // Erase a whole slot (every 64 KiB block of it): e <slot>\n
+                // Erase a whole slot, one erase operation at a time (the NOR uses 64 KiB blocks
+                // where it can): e <slot>\n. One '.' per finished step, then OK or ERR, so the
+                // host can time out per step.
                 let slot = match parse_slot(read_arg_byte()) {
                     Ok(slot) => slot,
                     Err(e) => {
@@ -682,8 +702,8 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                         continue;
                     }
                 };
-                let blocks = match slot_erase_blocks(layout(), slot) {
-                    Ok(blocks) => blocks,
+                let mut erase = match SlotErase::new(&nor, layout(), slot) {
+                    Ok(erase) => erase,
                     Err(e) => {
                         uart_write_str(e.reply());
                         uart_write_str("\r\n");
@@ -691,18 +711,23 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                     }
                 };
                 let mut ok = true;
-                for addr in blocks {
+                loop {
                     Iwdg::kick();
-                    if nor.erase_block_64k(addr).is_err() {
-                        ok = false;
-                        break;
+                    match erase.step(&mut nor) {
+                        None => break,
+                        Some(Ok(_)) => uart_write_str("."),
+                        Some(Err(_)) => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
                 Iwdg::kick();
                 uart_write_str(if ok { "OK\r\n" } else { "ERR\r\n" });
             }
             b'w' | b'W' => {
-                // Write chunk: w <slot> <offset_hex> <len_hex>\n<bytes>   (len <= 512)
+                // Write chunk: w <slot> <offset_hex> <len_hex>\n<bytes>   (len <= 512; offset and
+                // len must be multiples of the program word, `align` in the INFO line)
                 let slot = parse_slot(read_arg_byte());
                 let (offset, _) = match read_delimited_hex() {
                     (Some(o), d) => (o, d),
@@ -725,7 +750,15 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                 // Refuse anything that is not a whole write inside the slot. The payload the
                 // host is about to send is read and dropped first: left in the UART it would
                 // be taken for commands (it can contain 'e', 'w', 'm', 'r').
-                let addr = match slot.and_then(|s| write_address(layout(), s, offset, len)) {
+                let addr = match slot.and_then(|s| {
+                    write_address(
+                        layout(),
+                        s,
+                        offset,
+                        len,
+                        <SpiNorIoOpsDriver as boot_flash::Flash>::PROGRAM_ALIGN,
+                    )
+                }) {
                     Ok(addr) => addr,
                     Err(e) => {
                         for _ in 0..drain_len(len) {
@@ -742,7 +775,7 @@ fn enter_rescue_mode(_reason: u8) -> ! {
                 for b in buf.iter_mut().take(n) {
                     *b = uart_read_byte_blocking();
                 }
-                if nor.write(addr, &buf[..n]).is_ok() {
+                if boot_flash::Flash::program(&mut nor, addr, &buf[..n]).is_ok() {
                     uart_write_str("OK\r\n");
                 } else {
                     uart_write_str("ERR_WR\r\n");

@@ -7,3 +7,9 @@ description = "Pure helpers for the UART rescue protocol (slot argument, write r
 
 [dependencies]
 boot-layout = { workspace = true }
+boot-flash = { workspace = true }
+
+[dev-dependencies]
+boot-flash = { workspace = true, features = ["std"] }
+boot-nor = { workspace = true, features = ["std"] }
+boot-abi = { workspace = true }

@@ -292,15 +292,17 @@ Host Check     : PASS
 
 ## 6. Existing Rescue UART Protocol
 
-The first implementation must support the existing protocol without requiring an immediate protocol redesign.
+The Host speaks rescue protocol version 2 (an earlier protocol had no version and no way to ask the device
+anything; it is not supported). The Host reads `i` first and refuses a device that does not answer a version 2
+`INFO` line.
 
-Current commands:
+Commands:
 
 | Command | Description | Expected response |
 |---|---|---|
 | `p` | Ping | `PONG` |
-| `i` | Device information | Information line |
-| `e <slot>` | Erase Slot | `OK` |
+| `i` | Device information | One `INFO` line (see 6.1) |
+| `e <slot>` | Erase Slot | One `.` per finished erase step, then `OK` |
 | `w <slot> <offset_hex> <len_hex>` | Write binary chunk | `OK` |
 | `m <slot>` | Mark Pending | `OK` |
 | `j` | Dump Journal | Multiple diagnostic lines |
@@ -318,7 +320,8 @@ w <slot> <offset_hex> <length_hex>\n
 <binary payload>
 ```
 
-Chunk size must not exceed 512 bytes.
+Chunk size must not exceed 512 bytes, and the offset and the length must be multiples of the device's program
+word (`align` in the `INFO` line); the Host pads the last chunk with `0xFF`.
 
 The Host must use stop-and-wait transfer:
 
@@ -333,19 +336,37 @@ Never send the next chunk before receiving the previous chunk's ACK.
 ### 6.1 Protocol Behaviour and Former Limitations
 
 Earlier Bootloaders had defects in the rescue commands. They are fixed in the Bootloader (`boot-rescue`
-crate and `enter_rescue_mode`); there is no firmware version query yet, so the Host cannot tell an old
-Bootloader from a fixed one and must treat any reply other than `OK` as a failure.
+crate and `enter_rescue_mode`). The `INFO` line carries the protocol version, so the Host can tell; it must
+still treat any reply other than `OK` as a failure.
+
+**I command** `i`
+
+Answers one line of space-separated `key=value` pairs, all numbers decimal and the board name without spaces:
+
+```text
+INFO proto=2 board=h750-netlite bl=1 flash=4194304 align=1 chunk=512 slot0=655360 slot1=655360 window=524288
+```
+
+`proto` is the protocol version, `bl` the Bootloader version, `flash` the device size in bytes, `align` its
+program word, `chunk` the largest `w` payload to send (a whole number of program words), `slot0` and `slot1`
+the Slot sizes, and `window` the largest image the board can execute (`0`: no such limit). The Host ignores keys
+it does not know, so the Bootloader can add some; it refuses a line with a missing or malformed known key.
+`tools/rescue_upload.py` (`parse_info`) and `crates/boot-rescue` (`H750_INFO`) assert the same literal.
 
 **E command** `e <slot>`
 
-Erases the whole Slot (every 64KB block; 10 blocks on the H750 NetLite) and answers `OK` afterwards. It takes
-several seconds (64KB block erase: typical 180 ms, worst case 2 s), so the Host must wait up to about 40 s.
+Erases the whole Slot, one erase operation at a time (the H750 NetLite's NOR uses 64KB blocks where the Slot
+allows: 10 per Slot; a device with larger sectors uses those), and prints one `.` after each finished step, then
+`OK`, or `ERR` if a step failed (the erase stops there). A Slot that is not made of whole erase units of the
+device is refused with `ERR_ALIGN`. The Host must time out per step, not for the whole erase: the first step can
+take as long as one erase operation (64KB block: typical 180 ms, worst case 2 s), and a slot of many steps takes
+many times that. `rescue_upload.py` allows 15 s of silence between two steps (`--step-timeout`).
 Older Bootloaders erased only the first 64KB block of a 640KB Slot.
 
 **W command** `w <slot> <offset_hex> <len_hex>\n<bytes>`
 
-The whole write must lie inside the Slot and be 1..512 bytes. Replies: `OK`, `ERR_SLOT`, `ERR_LEN`,
-`ERR_RANGE`, `ERR_WR`. A refused write still reads and drops its announced payload (at most 4096 bytes), so
+The whole write must lie inside the Slot, be 1..512 bytes, and have an offset and a length that are multiples of
+the program word (`align`). Replies: `OK`, `ERR_SLOT`, `ERR_LEN`, `ERR_RANGE`, `ERR_ALIGN`, `ERR_WR`. A refused write still reads and drops its announced payload (at most 4096 bytes), so
 the Host stays in sync. Older Bootloaders did no range check and cut a longer length to 512, which could write
 outside the Slot and desynchronize the Host.
 
@@ -361,11 +382,11 @@ Exactly `0` or `1`, otherwise `ERR_SLOT`. Older Bootloaders treated every other 
 
 ## 7. Device Information and Slot Inspection
 
-The initial protocol provides limited information.
+The protocol provides limited information.
 
 Available commands:
 
-- `i`: basic Bootloader information.
+- `i`: the `INFO` line (6.1): protocol version and device parameters.
 - `j`: Journal dump.
 
 The Host must preserve the full Journal dump and parse known fields when possible.

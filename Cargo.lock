@@ -237,7 +237,10 @@ dependencies = [
 name = "boot-rescue"
 version = "0.1.0"
 dependencies = [
+ "boot-abi",
+ "boot-flash",
  "boot-layout",
+ "boot-nor",
 ]
 
 [[package]]

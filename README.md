@@ -227,10 +227,15 @@ python3 tools/rescue_upload.py \
     --slot 0
 ```
 
-**UART rescue:** `e` erases the whole slot (every 64KB block, so it takes seconds), `w` refuses writes that
-leave the slot, and `m` verifies the image before marking it Pending, using the version stored in the image
-header. The size limit on the H750 NetLite is the 512KB AXI SRAM window the image is loaded into, not the
-640KB slot; `rescue_upload.py` warns before uploading a larger image. `xtask sign` signs every image as
+**UART rescue (protocol version 2):** `i` answers one `INFO` line with the protocol version and what the host
+needs to know about the board (program word, chunk size, slot sizes, RAM window); `rescue_upload.py` reads it
+first and refuses a bootloader that speaks another version (an old bootloader has no `INFO` line, so flash a
+current one first). `e` erases the whole slot one erase operation at a time (the H750's NOR uses 64KB blocks,
+so it takes seconds) and prints a `.` for each finished step, so the host waits per step rather than for a
+fixed time. `w` refuses writes that leave the slot or are not whole program words (`ERR_ALIGN`; the tool pads
+the last chunk with `0xFF`), and `m` verifies the image before marking it Pending, using the version stored in
+the image header. The size limit on the H750 NetLite is the 512KB AXI SRAM window the image is loaded into, not
+the 640KB slot; `rescue_upload.py` warns before uploading a larger image. `xtask sign` signs every image as
 `1.0.0+1` unless `--major`, `--minor`, `--rev` or `--build` are given, and the bootloader journals exactly that
 version, so two images signed without them are indistinguishable in the journal (`j`). `rescue_upload.py` prints
 the version it is about to upload.
