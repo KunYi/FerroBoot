@@ -2,6 +2,8 @@
 //!
 //! Subcommands:
 //! - `sign`: Prepend MCUboot header, calculate SHA-256, sign with ECDSA P-256, append TLVs
+//! - `pad`: Pad a raw binary to a given size
+//! - `corrupt`: Flip one body bit in a signed image (test input)
 //! - `encrypt`: Encrypt image body with XChaCha20 transit key, append ENC_INFO TLV
 //! - `size-check`: Verify compiled bootloader ELF size against 96KB budget
 //! - `gen-keys`: Generate EC key pairs and cryptographic secrets
@@ -33,6 +35,10 @@ struct Cli {
     command: Commands,
 }
 
+fn parse_hex_byte(s: &str) -> Result<u8, String> {
+    u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("not a hex byte: {e}"))
+}
+
 /// Resolve `--board` to its layout, listing the known boards on a typo.
 fn resolve_board(name: &str) -> Result<&'static Layout, Box<dyn std::error::Error>> {
     boot_layout::by_name(name).ok_or_else(|| {
@@ -57,6 +63,29 @@ enum Commands {
         rev: u16,
         #[arg(long, default_value_t = 1)]
         build: u32,
+    },
+    /// Pad a raw binary with a fill byte (default 0xFF) up to `size` bytes (to make an image larger than a threshold)
+    Pad {
+        #[arg(short, long)]
+        bin: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Target size in bytes
+        #[arg(long)]
+        size: usize,
+        /// Fill byte, in hex (default FF, the erased value of a NOR flash)
+        #[arg(long, default_value = "ff", value_parser = parse_hex_byte)]
+        fill: u8,
+    },
+    /// Flip one bit in the body of a signed image so its hash no longer matches
+    Corrupt {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Offset into the image body (after the header); default is the middle
+        #[arg(long)]
+        offset: Option<usize>,
     },
     /// Encrypt a signed image for OTA transit using project key
     Encrypt {
@@ -88,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             build,
         } => {
             println!("[xtask] Signing binary: {:?}", bin);
+            println!("[xtask] Version: {}.{}.{}+{}", major, minor, rev, build);
             let load_addr = layout
                 .load_addr()
                 .ok_or("selected board does not use a RAM-load execution model")?;
@@ -174,6 +204,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             fs::write(&out, &output)?;
             println!("[xtask] Signed image successfully written to {:?} ({} bytes)", out, output.len());
+        }
+        Commands::Pad { bin, out, size, fill } => {
+            let mut data = fs::read(&bin)?;
+            if data.len() > size {
+                return Err(format!("{:?} is already {} bytes, larger than {}", bin, data.len(), size).into());
+            }
+            data.resize(size, fill);
+            fs::write(&out, &data)?;
+            println!("[xtask] Padded {:?} to {} bytes with 0x{:02X} -> {:?}", bin, size, fill, out);
+        }
+        Commands::Corrupt { input, out, offset } => {
+            let mut data = fs::read(&input)?;
+            let hdr = EXPECTED_HDR_SIZE as usize;
+            if data.len() < hdr + 4 {
+                return Err("file too small to be a signed image".into());
+            }
+            let img_size = u32::from_le_bytes(data[20..24].try_into()?) as usize;
+            let off = offset.unwrap_or(img_size / 2);
+            if off >= img_size || hdr + img_size > data.len() {
+                return Err(format!("offset {} outside the image body ({} bytes)", off, img_size).into());
+            }
+            data[hdr + off] ^= 0x01;
+            fs::write(&out, &data)?;
+            println!("[xtask] Flipped one bit at body offset {} -> {:?}", off, out);
         }
         Commands::Encrypt { input, out, key_id } => {
             println!("[xtask] Encrypting image for OTA transit: {:?}", input);
