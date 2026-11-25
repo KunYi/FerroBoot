@@ -303,6 +303,9 @@ class FakeBoard:
                     return
                 self.log.append(line)
                 slot = int(line.split()[1])
+                if slot not in (0, 1):
+                    self.tx += b"ERR_SLOT\r\n"
+                    continue
                 if c == "m":
                     self.marked.append(slot)
                     self.tx += b"OK\r\n"
@@ -329,7 +332,9 @@ class FakeBoard:
                 self.log.append(f"w {slot} {off:x} {ln:x}")
                 align = int(self.info.split(" align=")[1].split()[0])
                 chunk = int(self.info.split(" chunk=")[1].split()[0])
-                if ln > chunk:
+                if slot not in (0, 1):
+                    self.tx += b"ERR_SLOT\r\n"
+                elif ln == 0 or ln > chunk:
                     self.tx += b"ERR_LEN\r\n"
                 elif off + ln > self.slot_len:
                     self.tx += b"ERR_RANGE\r\n"
@@ -340,6 +345,37 @@ class FakeBoard:
                     self.tx += b"OK\r\n"
             else:
                 del self.rx[0]  # like the firmware: ignore stray bytes
+
+
+class Probe(unittest.TestCase):
+    def run_probe(self, board):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            return rescue_upload.run_probe(board, rescue_upload.parse_info(board.info))
+
+    def test_a_correct_bootloader_refuses_every_case_and_nothing_is_written(self):
+        board = FakeBoard(H750_INFO)
+        self.assertEqual(self.run_probe(board), [])
+        self.assertEqual(board.marked, [])
+        for slot in (0, 1):
+            self.assertTrue(all(b == 0xFF for b in board.flash[slot]))
+        self.assertFalse(any(x.startswith("e ") and x != "e 2" for x in board.log))
+
+    def test_every_reply_the_probe_expects_is_distinct_per_cause(self):
+        cases = rescue_upload.probe_cases(rescue_upload.parse_info(H750_INFO))
+        self.assertEqual({e for _, _, e in cases}, {"ERR_SLOT", "ERR_RANGE", "ERR_LEN"})
+
+    def test_a_word_programmed_board_also_gets_an_alignment_case(self):
+        info = H750_INFO.replace("align=1", "align=4")
+        names = [n for n, _, _ in rescue_upload.probe_cases(rescue_upload.parse_info(info))]
+        self.assertIn("w: offset not a whole word", names)
+
+    def test_a_wrong_reply_is_reported(self):
+        board = FakeBoard(H750_INFO)
+        board.slot_len = 10 ** 9   # this "bootloader" does not check the range
+        failed = self.run_probe(board)
+        self.assertEqual([f[0] for f in failed][:1], ["w: offset at the end of the slot"])
 
 
 class EndToEnd(unittest.TestCase):

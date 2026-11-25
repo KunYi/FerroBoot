@@ -22,6 +22,7 @@ Slot is exactly "0" or "1"; anything else is answered with ERR_SLOT.
 
 Usage:
   pip install pyserial
+  python3 rescue_upload.py --port /dev/ttyUSB0 --probe   # check the error replies, writes nothing
   python3 rescue_upload.py --port /dev/ttyUSB0 --image app_signed.bin --slot 0
 """
 import argparse
@@ -167,11 +168,50 @@ def cmd(ser, data, expect, timeout=3.0):
     return resp
 
 
+def probe_cases(info):
+    """Requests that must be refused, as (name, request bytes, expected reply).
+
+    Nothing here can change the flash or the journal: every case is refused before it acts. A
+    refused 'w' still has its payload read and dropped by the bootloader, so each one carries it.
+    """
+    slot_len = info["slot0"]
+    chunk = info["chunk"]
+    cases = [
+        ("w: bad slot", b"w 2 0 1\nX", "ERR_SLOT"),
+        ("w: offset at the end of the slot", f"w 0 {slot_len:x} 1\n".encode() + b"X", "ERR_RANGE"),
+        ("w: offset overflows", b"w 0 ffffffff 2\nXX", "ERR_RANGE"),
+        ("w: zero length", b"w 0 0 0\n", "ERR_LEN"),
+        ("w: longer than a chunk", f"w 0 0 {chunk + 1:x}\n".encode() + b"X" * (chunk + 1), "ERR_LEN"),
+        ("e: bad slot", b"e 2\n", "ERR_SLOT"),
+        ("m: bad slot", b"m 2\n", "ERR_SLOT"),
+    ]
+    if info["align"] > 1:
+        cases.append(("w: offset not a whole word",
+                      b"w 0 1 " + f"{info['align']:x}\n".encode() + b"X" * info["align"], "ERR_ALIGN"))
+    return cases
+
+
+def run_probe(ser, info):
+    """Send every probe case; return the list of (name, expected, got) that did not match."""
+    failures = []
+    for name, request, expected in probe_cases(info):
+        ser.write(request)
+        ser.flush()
+        got = read_line(ser, 3.0)
+        print(f"  {'ok  ' if got == expected else 'FAIL'} {name}: {got!r}")
+        if got != expected:
+            failures.append((name, expected, got))
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", required=True)
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--image", required=True)
+    ap.add_argument("--image", help="signed image to upload (not needed with --probe)")
+    ap.add_argument("--probe", action="store_true",
+                    help="send requests that must be refused (ERR_SLOT, ERR_RANGE, ERR_LEN, ...) "
+                         "and check the replies; changes nothing on the board")
     ap.add_argument("--slot", choices=["0", "1"], default="0")
     ap.add_argument("--step-timeout", type=float, default=STEP_TIMEOUT,
                     help="seconds of silence allowed between two erase steps")
@@ -179,12 +219,15 @@ def main():
     ap.add_argument("--no-reboot", action="store_true")
     args = ap.parse_args()
 
-    img = open(args.image, "rb").read()
-    if len(img) < 32 or int.from_bytes(img[:4], "little") != 0x96F3B83D:
+    if not args.probe and not args.image:
+        ap.error("--image is required unless --probe is given")
+    img = b"" if args.probe else open(args.image, "rb").read()
+    if not args.probe and len(img) < 32 or int.from_bytes(img[:4], "little") != 0x96F3B83D:
         sys.exit("Not a signed image (bad header magic). Run xtask sign first.")
     # xtask sign defaults to 1.0.0+1 unless --major/--minor/--rev/--build are given, so two
     # images signed without them look identical to the bootloader's journal.
-    print(f"Image {args.image}: {len(img)} bytes, version {header_version(img)}")
+    if not args.probe:
+        print(f"Image {args.image}: {len(img)} bytes, version {header_version(img)}")
 
     ser = serial.Serial(args.port, args.baud, timeout=0.05)
     ser.reset_input_buffer()
@@ -200,6 +243,11 @@ def main():
         sys.exit(f"ERROR: cannot talk to this bootloader: {e}")
     print(f"Bootloader: board {info['board']}, bl {info['bl']}, program word {info['align']}, "
           f"chunk {info['chunk']}, flash {info['flash']} bytes")
+
+    if args.probe:
+        print("Probing error replies (nothing is written)...")
+        failures = run_probe(ser, info)
+        sys.exit(f"{len(failures)} probe(s) failed" if failures else 0)
 
     slot_len = info[f"slot{args.slot}"]
     problem = size_problem(len(img), slot_len, info["window"], info["align"])
