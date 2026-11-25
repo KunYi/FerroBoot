@@ -12,6 +12,12 @@ use boot_layout::H750_NETLITE;
 use cortex_m_rt::{entry, exception};
 use panic_halt as _;
 
+/// Names the build in the log (see the bootloader's `BUILD_TAG`).
+const BUILD_TAG: &str = match option_env!("FERROBOOT_BUILD") {
+    Some(tag) => tag,
+    None => "unknown",
+};
+
 static APP_IO_OPS: IoOps = IoOps {
     spi_transfer: Some(app_spi_transfer),
     cs: Some(app_cs),
@@ -55,6 +61,9 @@ fn main() -> ! {
     boot_stm32h7::uart_write_str("\r\n========================================\r\n");
     boot_stm32h7::uart_write_str("[APP] Hello from Application running in AXI SRAM!\r\n");
     boot_stm32h7::uart_write_str("[APP] VTOR: 0x24000400, Executing from RAM.\r\n");
+    boot_stm32h7::uart_write_str("[APP] build: ");
+    boot_stm32h7::uart_write_str(BUILD_TAG);
+    boot_stm32h7::uart_write_str("\r\n");
 
     // Connect to the Bootloader ABI table (address comes from the board layout).
     // SAFETY: the H750 NetLite bootloader places its ABI table at this address.

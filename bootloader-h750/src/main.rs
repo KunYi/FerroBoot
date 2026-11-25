@@ -419,6 +419,9 @@ fn main() -> ! {
     uart_write_str("\r\n========================================\r\n");
     uart_write_str("[BL] STM32H750 Rust Bootloader v1.0\r\n");
     uart_write_str("[BL] 400MHz / VOS1, AXI SRAM Loader Mode\r\n");
+    uart_write_str("[BL] build: ");
+    uart_write_str(BUILD_TAG);
+    uart_write_str("\r\n");
     uart_write_str("========================================\r\n");
 
     // 2. Check TAMP rescue request or KEY2 press
@@ -653,6 +656,13 @@ fn read_delimited_hex() -> (Option<u32>, u8) {
         digits += 1;
     }
 }
+
+/// Names the build in the boot log, so a log says which firmware produced it. `make` sets
+/// `FERROBOOT_BUILD` to `git describe --always --dirty`; a plain `cargo build` has none.
+const BUILD_TAG: &str = match option_env!("FERROBOOT_BUILD") {
+    Some(tag) => tag,
+    None => "unknown",
+};
 
 /// Lets the pure `write_info` write straight to the UART.
 struct UartOut;

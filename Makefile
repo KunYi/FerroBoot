@@ -7,6 +7,10 @@ CARGO_FLAGS  := --release --locked
 PORT         := /dev/ttyACM0
 SLOT         ?= 0
 
+# Names the build in the boot log. `--dirty` marks uncommitted changes to tracked files.
+BUILD_TAG    := $(shell git describe --always --dirty --tags 2>/dev/null || echo unknown)
+export FERROBOOT_BUILD := $(BUILD_TAG)
+
 # Artifact paths
 RELEASE_DIR  := target/$(TARGET)/release
 BOOT_ELF     := $(RELEASE_DIR)/bootloader-h750
@@ -35,7 +39,7 @@ XTASK_BUILD_INPUTS := $(shell find tools/xtask -type f \
 
 XTASK_BUILD_INPUTS += Cargo.toml Cargo.lock
 
-.PHONY: all build boot flash-boot app sign upload clean
+.PHONY: all build boot flash-boot app sign upload clean FORCE
 # Default target: build both firmware components and sign the application
 all: build sign
 
@@ -51,8 +55,16 @@ flash-boot: boot
 	$(PROBE_RS) download --chip $(CHIP) $(BOOT_ELF)
 	$(PROBE_RS) reset --chip $(CHIP)
 
-# Build the application ELF only when its inputs have changed
-$(APP_ELF): $(APP_BUILD_INPUTS)
+# The tag is compiled into the ELF, so a new tag has to rebuild it even if no source changed.
+# The stamp file changes only when the tag does.
+TAG_STAMP := $(RELEASE_DIR)/.build_tag
+FORCE:
+$(TAG_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(BUILD_TAG)' | cmp -s - $@ || echo '$(BUILD_TAG)' > $@
+
+# Build the application ELF only when its inputs (or the build tag) have changed
+$(APP_ELF): $(APP_BUILD_INPUTS) $(TAG_STAMP)
 	cargo build $(CARGO_FLAGS) --target $(TARGET) -p app-template
 	@touch $@
 
