@@ -18,6 +18,18 @@ const BUILD_TAG: &str = match option_env!("FERROBOOT_BUILD") {
     None => "unknown",
 };
 
+/// Test variants (see Cargo.toml): chosen by feature, but as constants rather than `#[cfg]`, so
+/// every variant compiles all of the code and the unused branches are simply optimised away.
+const CONFIRM: bool = !cfg!(feature = "trial-no-confirm");
+const KICK_WATCHDOG: bool = !cfg!(feature = "trial-hang");
+const VARIANT: &str = if cfg!(feature = "trial-hang") {
+    "trial-hang"
+} else if cfg!(feature = "trial-no-confirm") {
+    "trial-no-confirm"
+} else {
+    "normal"
+};
+
 static APP_IO_OPS: IoOps = IoOps {
     spi_transfer: Some(app_spi_transfer),
     cs: Some(app_cs),
@@ -63,6 +75,8 @@ fn main() -> ! {
     boot_stm32h7::uart_write_str("[APP] VTOR: 0x24000400, Executing from RAM.\r\n");
     boot_stm32h7::uart_write_str("[APP] build: ");
     boot_stm32h7::uart_write_str(BUILD_TAG);
+    boot_stm32h7::uart_write_str(", variant: ");
+    boot_stm32h7::uart_write_str(VARIANT);
     boot_stm32h7::uart_write_str("\r\n");
 
     // Connect to the Bootloader ABI table (address comes from the board layout).
@@ -98,7 +112,14 @@ fn main() -> ! {
                     false
                 }
             };
-            if testing {
+            if testing && !CONFIRM {
+                boot_stm32h7::uart_write_str("[APP] On trial and NOT confirming (test variant).\r\n");
+                if !KICK_WATCHDOG {
+                    boot_stm32h7::uart_write_str(
+                        "[APP] Not kicking the watchdog either: a reset is expected in ~3 s.\r\n",
+                    );
+                }
+            } else if testing {
                 boot_stm32h7::uart_write_str("[APP] Confirming firmware update via ABI...\r\n");
                 match client.confirm(&APP_IO_OPS) {
                     Ok(()) => boot_stm32h7::uart_write_str(
@@ -131,7 +152,9 @@ fn main() -> ! {
     let mut led_state = false;
 
     loop {
-        boot_stm32h7::Iwdg::kick();
+        if KICK_WATCHDOG {
+            boot_stm32h7::Iwdg::kick();
+        }
 
         let now = boot_stm32h7::millis();
         // Print tick every 1000 ms.

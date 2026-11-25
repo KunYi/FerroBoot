@@ -10,6 +10,14 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Test variants for the board runs (docs/board-verification.md). A release image uses neither.
+# trial-no-confirm: on trial, do not confirm. The watchdog is still kicked, so the image keeps
+#                   running until it is reset by hand, and each boot uses up one trial.
+# trial-hang:       as above, and stop kicking the watchdog: the board resets itself.
+trial-no-confirm = []
+trial-hang = ["trial-no-confirm"]
+
 [dependencies]
 cortex-m = { workspace = true }
 cortex-m-rt = { workspace = true }
