@@ -378,8 +378,8 @@ class Probe(unittest.TestCase):
         self.assertEqual([f[0] for f in failed][:1], ["w: offset at the end of the slot"])
 
 
-class EndToEnd(unittest.TestCase):
-    """rescue_upload.main() against FakeBoard: the exchange as a whole, not just its helpers."""
+class MainHarness(unittest.TestCase):
+    """Runs rescue_upload.main() against a FakeBoard. No tests of its own."""
 
     def setUp(self):
         import tempfile
@@ -407,6 +407,10 @@ class EndToEnd(unittest.TestCase):
         import contextlib
         import io
         return contextlib.redirect_stdout(io.StringIO())
+
+
+class EndToEnd(MainHarness):
+    """rescue_upload.main() against FakeBoard: the exchange as a whole, not just its helpers."""
 
     def test_a_whole_upload_to_the_h750_ends_with_the_image_in_the_slot_and_marked(self):
         path, img = self.image(4584)  # the size from the board run that found the CRLF bug
@@ -536,6 +540,65 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("'ERR_RANGE'", str(cm.exception))
         self.assertIn("0x800", str(cm.exception))
         self.assertEqual(board.marked, [])
+
+
+class ProbeEndToEnd(MainHarness):
+    """`--probe` through main(): the arguments, the preamble, and the exit status."""
+
+    def run_main(self, board, *extra):
+        argv = ["rescue_upload.py", "--port", "fake", *extra]
+        old = (sys.argv, rescue_upload.serial)
+        sys.argv, rescue_upload.serial = argv, types.SimpleNamespace(Serial=lambda *a, **k: board)
+        try:
+            with self.quiet():
+                rescue_upload.main()
+        finally:
+            sys.argv, rescue_upload.serial = old
+
+    def test_probe_needs_no_image_and_reaches_the_board(self):
+        # The bug this guards: main() checked the image header even with --probe (no image), and
+        # exited with "Not a signed image" before sending anything.
+        board = FakeBoard(H750_INFO)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(board, "--probe")
+        self.assertEqual(cm.exception.code, 0, "all probes refused as expected: exit status 0")
+        self.assertEqual(board.log[:2], ["p", "i"])
+        self.assertGreater(len(board.log), 2, "the probe cases were sent")
+
+    def test_probe_changes_nothing_on_the_board(self):
+        board = FakeBoard(H750_INFO)
+        with self.assertRaises(SystemExit):
+            self.run_main(board, "--probe")
+        self.assertEqual(board.marked, [])
+        self.assertNotIn("r", board.log)
+        for slot in (0, 1):
+            self.assertTrue(all(b == 0xFF for b in board.flash[slot]))
+        # the only erase or mark it may send is the refused one, for slot 2
+        self.assertEqual([x for x in board.log if x[:1] in "em"], ["e 2", "m 2"])
+
+    def test_a_probe_that_fails_ends_with_a_message_and_a_failing_status(self):
+        board = FakeBoard(H750_INFO)
+        board.slot_len = 10 ** 9  # a board that does not check the range
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(board, "--probe")
+        self.assertIn("probe(s) failed", str(cm.exception.code))
+
+    def test_probe_still_refuses_an_old_bootloader(self):
+        board = FakeBoard("[RESCUE] BL v1.0, STM32H750, NOR BY25Q32ES")
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(board, "--probe")
+        self.assertIn("cannot talk to this bootloader", str(cm.exception.code))
+        self.assertEqual(board.log, ["p", "i"])
+
+    def test_without_probe_an_image_is_still_required_and_checked(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(FakeBoard(H750_INFO))
+        self.assertEqual(cm.exception.code, 2, "argparse: --image is required unless --probe")
+        path = os.path.join(self.tmp.name, "junk.bin")
+        open(path, "wb").write(b"\x00" * 64)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(FakeBoard(H750_INFO), "--image", path)
+        self.assertIn("Not a signed image", str(cm.exception.code))
 
 
 if __name__ == "__main__":

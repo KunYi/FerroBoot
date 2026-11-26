@@ -219,14 +219,15 @@ def main():
     ap.add_argument("--no-reboot", action="store_true")
     args = ap.parse_args()
 
-    if not args.probe and not args.image:
-        ap.error("--image is required unless --probe is given")
-    img = b"" if args.probe else open(args.image, "rb").read()
-    if not args.probe and len(img) < 32 or int.from_bytes(img[:4], "little") != 0x96F3B83D:
-        sys.exit("Not a signed image (bad header magic). Run xtask sign first.")
-    # xtask sign defaults to 1.0.0+1 unless --major/--minor/--rev/--build are given, so two
-    # images signed without them look identical to the bootloader's journal.
+    img = b""
     if not args.probe:
+        if not args.image:
+            ap.error("--image is required unless --probe is given")
+        img = open(args.image, "rb").read()
+        if len(img) < 32 or int.from_bytes(img[:4], "little") != 0x96F3B83D:
+            sys.exit("Not a signed image (bad header magic). Run xtask sign first.")
+        # xtask sign defaults to 1.0.0+1 unless --major/--minor/--rev/--build are given, so two
+        # images signed without them look identical to the bootloader's journal.
         print(f"Image {args.image}: {len(img)} bytes, version {header_version(img)}")
 
     ser = serial.Serial(args.port, args.baud, timeout=0.05)
