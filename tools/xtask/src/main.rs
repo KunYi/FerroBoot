@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use boot_abi::ImageVersion;
 use boot_image::{
@@ -37,6 +37,40 @@ struct Cli {
 
 fn parse_hex_byte(s: &str) -> Result<u8, String> {
     u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("not a hex byte: {e}"))
+}
+
+/// `data` extended to `size` bytes with `fill`; an error if it is already longer.
+fn pad_to(mut data: Vec<u8>, size: usize, fill: u8) -> Result<Vec<u8>, String> {
+    if data.len() > size {
+        return Err(format!("already {} bytes, larger than {}", data.len(), size));
+    }
+    data.resize(size, fill);
+    Ok(data)
+}
+
+/// A copy of a signed image with one bit of its body flipped, so the hash no longer matches, and the
+/// body offset that was changed (default: the middle of the body). The body is found from the
+/// header (`ih_hdr_size`, `ih_img_size`), so this works for any version and any image size.
+fn corrupt_image(data: &[u8], offset: Option<usize>) -> Result<(Vec<u8>, usize), String> {
+    let (hdr, _) = ImageHeader::read_from_prefix(data)
+        .map_err(|_| "file too small to be a signed image".to_string())?;
+    if hdr.ih_magic != IMAGE_MAGIC {
+        return Err("not a signed image (bad header magic)".into());
+    }
+    let (hdr_size, img_size) = (hdr.ih_hdr_size as usize, hdr.ih_img_size as usize);
+    if hdr_size.checked_add(img_size).map_or(true, |end| end > data.len()) {
+        return Err(format!(
+            "the header announces a {hdr_size}-byte header and a {img_size}-byte body, the file has {} bytes",
+            data.len()
+        ));
+    }
+    let off = offset.unwrap_or(img_size / 2);
+    if off >= img_size {
+        return Err(format!("offset {off} is outside the image body ({img_size} bytes)"));
+    }
+    let mut out = data.to_vec();
+    out[hdr_size + off] ^= 0x01;
+    Ok((out, off))
 }
 
 /// Resolve `--board` to its layout, listing the known boards on a typo.
@@ -206,26 +240,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[xtask] Signed image successfully written to {:?} ({} bytes)", out, output.len());
         }
         Commands::Pad { bin, out, size, fill } => {
-            let mut data = fs::read(&bin)?;
-            if data.len() > size {
-                return Err(format!("{:?} is already {} bytes, larger than {}", bin, data.len(), size).into());
-            }
-            data.resize(size, fill);
+            let data = pad_to(fs::read(&bin)?, size, fill).map_err(|e| format!("{:?}: {}", bin, e))?;
             fs::write(&out, &data)?;
             println!("[xtask] Padded {:?} to {} bytes with 0x{:02X} -> {:?}", bin, size, fill, out);
         }
         Commands::Corrupt { input, out, offset } => {
-            let mut data = fs::read(&input)?;
-            let hdr = EXPECTED_HDR_SIZE as usize;
-            if data.len() < hdr + 4 {
-                return Err("file too small to be a signed image".into());
-            }
-            let img_size = u32::from_le_bytes(data[20..24].try_into()?) as usize;
-            let off = offset.unwrap_or(img_size / 2);
-            if off >= img_size || hdr + img_size > data.len() {
-                return Err(format!("offset {} outside the image body ({} bytes)", off, img_size).into());
-            }
-            data[hdr + off] ^= 0x01;
+            let (data, off) = corrupt_image(&fs::read(&input)?, offset)
+                .map_err(|e| format!("{:?}: {}", input, e))?;
             fs::write(&out, &data)?;
             println!("[xtask] Flipped one bit at body offset {} -> {:?}", off, out);
         }
@@ -311,4 +332,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 32 header bytes `xtask sign --major 4 --minor 2 --rev 3 --build 7` wrote for a
+    /// 4096-byte binary (taken from the tool's own output): hdr_size 0x400, protect_tlv_size 12,
+    /// img_size 0x1000, flags 0x20, version 4.2.3+7. The version is deliberately not 1.0.0+1.
+    const HDR: [u8; 32] = [
+        0x3d, 0xb8, 0xf3, 0x96, 0x00, 0x00, 0x00, 0x24, 0x00, 0x04, 0x0c, 0x00, 0x00, 0x10, 0x00, 0x00,
+        0x20, 0x00, 0x00, 0x00, 0x04, 0x02, 0x03, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// A signed-image-shaped file: header, zeros up to 1024, `body` bytes, 100 trailer bytes.
+    fn image(hdr: [u8; 32], body: usize) -> Vec<u8> {
+        let mut v = hdr.to_vec();
+        v[12..16].copy_from_slice(&(body as u32).to_le_bytes());
+        v.resize(1024, 0);
+        v.extend((0..body).map(|i| (i % 251) as u8));
+        v.extend([0xEE; 100]);
+        v
+    }
+
+    fn differing(a: &[u8], b: &[u8]) -> Vec<usize> {
+        a.iter().zip(b).enumerate().filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn corrupt_flips_one_bit_in_the_middle_of_the_body() {
+        let img = image(HDR, 4096);
+        let (out, off) = corrupt_image(&img, None).unwrap();
+        assert_eq!(off, 2048);
+        assert_eq!(differing(&img, &out), vec![1024 + 2048]);
+        assert_eq!((img[1024 + 2048] ^ out[1024 + 2048]).count_ones(), 1);
+        assert_eq!(out.len(), img.len());
+    }
+
+    #[test]
+    fn the_body_is_found_from_the_header_whatever_the_version_is() {
+        // The first version of this read the u32 at byte 20 as the body size. That is the start of
+        // the version: 1.0.0 read as 1 (so the first body byte was flipped, which happened to work)
+        // and 4.2.3 as 197124 (so the tool refused the image).
+        for ver in [[1u8, 0, 0, 0, 1, 0, 0, 0], [4, 2, 3, 0, 7, 0, 0, 0], [255, 255, 255, 255, 255, 255, 255, 255]] {
+            let mut hdr = HDR;
+            hdr[20..28].copy_from_slice(&ver);
+            let img = image(hdr, 3480);
+            let (out, off) = corrupt_image(&img, None).unwrap();
+            assert_eq!(off, 1740, "version {ver:?}");
+            assert_eq!(differing(&img, &out), vec![1024 + 1740], "version {ver:?}");
+        }
+    }
+
+    #[test]
+    fn corrupt_changes_the_body_only_for_any_image_size() {
+        for body in [1usize, 2, 255, 4096, 327_680] {
+            let img = image(HDR, body);
+            let (out, off) = corrupt_image(&img, None).unwrap();
+            let d = differing(&img, &out);
+            assert_eq!(d, vec![1024 + body / 2], "body {body}");
+            assert_eq!(off, body / 2);
+            assert!(d[0] >= 1024 && d[0] < 1024 + body, "inside the body, not the header or the trailer");
+        }
+    }
+
+    #[test]
+    fn an_explicit_offset_is_used_and_checked_against_the_body() {
+        let img = image(HDR, 4096);
+        assert_eq!(differing(&img, &corrupt_image(&img, Some(0)).unwrap().0), vec![1024]);
+        assert_eq!(differing(&img, &corrupt_image(&img, Some(4095)).unwrap().0), vec![1024 + 4095]);
+        assert!(corrupt_image(&img, Some(4096)).is_err(), "one past the body");
+        assert!(corrupt_image(&img, Some(usize::MAX)).is_err());
+    }
+
+    #[test]
+    fn corrupt_refuses_what_is_not_a_signed_image() {
+        // too short for a header
+        assert!(corrupt_image(&[0u8; 20], None).is_err());
+        // wrong magic
+        let mut bad = image(HDR, 4096);
+        bad[0] ^= 0xFF;
+        assert!(corrupt_image(&bad, None).unwrap_err().contains("magic"));
+        // the body it announces is not all there
+        let short = &image(HDR, 4096)[..1024 + 4000];
+        assert!(corrupt_image(short, None).is_err());
+        // a body size of 0, and one that would overflow the sum
+        let mut zero = image(HDR, 4096);
+        zero[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(corrupt_image(&zero, None).is_err());
+        let mut huge = image(HDR, 4096);
+        huge[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(corrupt_image(&huge, None).is_err());
+    }
+
+    #[test]
+    fn pad_fills_with_the_byte_and_keeps_the_start() {
+        assert_eq!(pad_to(vec![1, 2, 3], 6, 0xA5).unwrap(), vec![1, 2, 3, 0xA5, 0xA5, 0xA5]);
+        assert_eq!(pad_to(vec![1, 2, 3], 3, 0x00).unwrap(), vec![1, 2, 3]);
+        assert_eq!(pad_to(vec![], 2, 0xFF).unwrap(), vec![0xFF, 0xFF]);
+        assert!(pad_to(vec![1, 2, 3, 4], 3, 0xFF).unwrap_err().contains("larger than 3"));
+    }
+
+    #[test]
+    fn the_two_big_image_fills_cannot_leave_a_stale_block_looking_fine() {
+        // 0xA5 and 0x5A are what `make test-img-big` pads with: flash programming ANDs, so any
+        // byte of a stale first image under the second is 0x00, never either fill.
+        for (a, b) in (0u8..=255).map(|_| (0xA5u8, 0x5Au8)).take(1) {
+            assert_eq!(a & b, 0x00);
+            assert_ne!(a, 0x00);
+            assert_ne!(b, 0x00);
+        }
+        // an 0xFF fill could not show a stale block: erased flash already reads 0xFF
+        assert_eq!(0xFFu8 & 0xA5, 0xA5);
+    }
 }
